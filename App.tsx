@@ -4,7 +4,7 @@ import StitchView from './views/StitchView';
 import SmartStitchView from './views/SmartStitchView';
 import ColorExplorerView from './views/ColorExplorerView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
-import { ImageLayer, StitchItem, AssetGroup, CropRegion } from './types';
+import { ImageLayer, StitchItem, AssetGroup, CropRegion, SmartStitchSession, SmartStitchSettings } from './types';
 import {
   Plus,
   BoxSelect,
@@ -34,8 +34,62 @@ import {
   CornerDownRight,
   Eye,
   Image as ImageIcon,
-  FileImage
+  FileImage,
+  CopyPlus
 } from 'lucide-react';
+
+const SMART_STITCH_STORAGE_KEY = 'laniameda.smart-stitch.sessions.v1';
+
+const DEFAULT_SMART_STITCH_SETTINGS: SmartStitchSettings = {
+  containerWidth: 1200,
+  targetRowHeight: 300,
+  spacing: 12,
+  backgroundColor: '#ffffff',
+  exportScale: 1,
+};
+
+const createSmartStitchSession = (index: number): SmartStitchSession => {
+  const timestamp = new Date().toISOString();
+  return {
+    id: crypto.randomUUID(),
+    name: `Stitch ${index}`,
+    images: [],
+    settings: { ...DEFAULT_SMART_STITCH_SETTINGS },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+};
+
+const hydrateSmartStitchSessions = (): SmartStitchSession[] => {
+  if (typeof window === 'undefined') {
+    return [createSmartStitchSession(1)];
+  }
+
+  try {
+    const raw = window.localStorage.getItem(SMART_STITCH_STORAGE_KEY);
+    if (!raw) return [createSmartStitchSession(1)];
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return [createSmartStitchSession(1)];
+    }
+
+    return parsed.map((session: Partial<SmartStitchSession>, index) => ({
+      id: session.id ?? crypto.randomUUID(),
+      name: session.name ?? `Stitch ${index + 1}`,
+      images: Array.isArray(session.images) ? session.images : [],
+      settings: {
+        ...DEFAULT_SMART_STITCH_SETTINGS,
+        ...(session.settings ?? {}),
+      },
+      createdAt: session.createdAt ?? new Date().toISOString(),
+      updatedAt: session.updatedAt ?? session.createdAt ?? new Date().toISOString(),
+    }));
+  } catch (error) {
+    console.error('Failed to restore Smart Stitch sessions', error);
+    return [createSmartStitchSession(1)];
+  }
+};
 
 function App() {
   const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'colors'>('editor');
@@ -60,10 +114,14 @@ function App() {
   const [layers, setLayers] = useState<ImageLayer[]>([]);
   const [groups, setGroups] = useState<AssetGroup[]>([]);
   const [stitchItems, setStitchItems] = useState<StitchItem[]>([]);
+  const [smartStitchSessions, setSmartStitchSessions] = useState<SmartStitchSession[]>(() => hydrateSmartStitchSessions());
+  const [activeSmartStitchSessionId, setActiveSmartStitchSessionId] = useState<string | null>(null);
 
   // Derived State
   const activeLayer = layers.find(l => l.id === activeAssetId);
   const activeGroup = groups.find(g => g.id === activeAssetId);
+  const activeSmartStitchSession =
+    smartStitchSessions.find((session) => session.id === activeSmartStitchSessionId) ?? smartStitchSessions[0] ?? null;
 
   // --- Theme Toggle ---
   useEffect(() => {
@@ -73,6 +131,18 @@ function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [isDarkMode]);
+
+  useEffect(() => {
+    if (smartStitchSessions.length === 0) return;
+    if (!activeSmartStitchSessionId || !smartStitchSessions.some((session) => session.id === activeSmartStitchSessionId)) {
+      setActiveSmartStitchSessionId(smartStitchSessions[0].id);
+    }
+  }, [smartStitchSessions, activeSmartStitchSessionId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(SMART_STITCH_STORAGE_KEY, JSON.stringify(smartStitchSessions));
+  }, [smartStitchSessions]);
 
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
 
@@ -413,6 +483,42 @@ function App() {
         const newItem: StitchItem = { id: crypto.randomUUID(), layerId, cropId };
         setStitchItems(prev => [...prev, newItem]);
     }
+  };
+
+  const handleCreateSmartStitchSession = () => {
+    const nextSession = createSmartStitchSession(smartStitchSessions.length + 1);
+    setSmartStitchSessions((prev) => [nextSession, ...prev]);
+    setActiveSmartStitchSessionId(nextSession.id);
+    setActiveTab('smartStitch');
+  };
+
+  const handleUpdateSmartStitchSession = (nextSession: SmartStitchSession) => {
+    setSmartStitchSessions((prev) =>
+      prev.map((session) =>
+        session.id === nextSession.id
+          ? {
+              ...nextSession,
+              updatedAt: nextSession.updatedAt ?? new Date().toISOString(),
+            }
+          : session
+      )
+    );
+  };
+
+  const handleDeleteSmartStitchSession = (sessionId: string) => {
+    setSmartStitchSessions((prev) => {
+      if (prev.length === 1) {
+        const freshSession = createSmartStitchSession(1);
+        setActiveSmartStitchSessionId(freshSession.id);
+        return [freshSession];
+      }
+
+      const nextSessions = prev.filter((session) => session.id !== sessionId);
+      if (activeSmartStitchSessionId === sessionId) {
+        setActiveSmartStitchSessionId(nextSessions[0]?.id ?? null);
+      }
+      return nextSessions;
+    });
   };
 
   // --- Filtered Library List ---
@@ -763,7 +869,12 @@ function App() {
            ) : activeTab === 'stitch' ? (
              <StitchView layers={layers} groups={groups} stitchItems={stitchItems} setStitchItems={setStitchItems} />
            ) : activeTab === 'smartStitch' ? (
-             <SmartStitchView />
+             activeSmartStitchSession ? (
+               <SmartStitchView
+                 session={activeSmartStitchSession}
+                 onUpdateSession={handleUpdateSmartStitchSession}
+               />
+             ) : null
            ) : (
              <ColorExplorerView />
            )}
@@ -771,186 +882,43 @@ function App() {
       </main>
 
       {/* --- RIGHT PANEL (LIBRARY) — hidden on self-contained views --- */}
-      {(activeTab === 'editor' || activeTab === 'stitch') && (
+      {(activeTab === 'editor' || activeTab === 'stitch' || activeTab === 'smartStitch') && (
       <aside className="w-80 bg-background border-l border-border flex flex-col z-20 shadow-sharp transition-colors duration-300">
-        
-        {/* Library Header */}
-        <div className="h-20 flex items-center justify-between px-6 border-b border-border bg-background/50 backdrop-blur-sm">
-           {!isSelectionMode ? (
-              <>
-                <div>
-                    <span className="font-mono text-[10px] text-accent tracking-widest uppercase block mb-1">LIBRARY</span>
-                    <span className="font-serif text-lg text-primary flex items-center gap-2 transition-colors duration-300">
-                        Assets <span className="font-sans text-xs text-secondary font-normal">({layers.length})</span>
-                    </span>
-                </div>
-                <div className="flex gap-2">
-                    <button 
-                        onClick={() => setIsSelectionMode(true)}
-                        className="w-10 h-10 flex items-center justify-center text-secondary hover:text-primary hover:bg-surface transition-colors rounded-full"
-                        title="Select Items"
-                    >
-                        <CheckSquare size={20} />
-                    </button>
-                    <button 
-                        onClick={() => fileInputRef.current?.click()}
-                        className="w-10 h-10 flex items-center justify-center bg-inverse text-inverseText hover:bg-accent hover:text-white transition-colors shadow-lg rounded-full"
-                        title="Upload"
-                    >
-                        <Plus size={20} />
-                    </button>
-                </div>
-              </>
-           ) : (
-               <div className="flex-1 flex items-center justify-between animate-fade-in">
-                   <span className="font-mono text-xs text-accent font-bold">{selectedLibraryIds.size} SELECTED</span>
-                   
-                   <div className="flex items-center gap-2">
-                       {selectedLibraryIds.size >= 2 && (
-                           <button 
-                               onClick={handleCreateGroup}
-                               className="h-9 px-3 bg-accent text-white rounded-md text-xs font-bold flex items-center gap-2 hover:bg-orange-600 transition-colors"
-                           >
-                               <Group size={16} /> Group
-                           </button>
-                       )}
-                       
-                       {selectedLibraryIds.size > 0 && (
-                           <button 
-                               onClick={handleDeleteSelected}
-                               className="h-9 w-9 bg-red-500/10 text-red-500 rounded-md flex items-center justify-center hover:bg-red-500 hover:text-white transition-colors"
-                           >
-                               <Trash2 size={16} />
-                           </button>
-                       )}
-                       
-                       <button 
-                            onClick={() => { setIsSelectionMode(false); setSelectedLibraryIds(new Set()); }}
-                            className="h-9 w-9 text-secondary hover:text-primary rounded-md flex items-center justify-center"
-                       >
-                            <X size={20} />
-                       </button>
-                   </div>
-               </div>
-           )}
-           <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept="image/*" multiple />
-        </div>
-
-        {/* Library List */}
-        <div className="flex-1 overflow-y-auto p-0 scroll-smooth">
-           {rootGroups.length === 0 && rootLayers.length === 0 && (
-             <div className="p-10 text-center border-b border-border border-dashed m-6">
-                <span className="text-xs text-secondary uppercase tracking-wider">Empty State</span>
-             </div>
-           )}
-
-           {/* GROUPS SECTION */}
-           {rootGroups.length > 0 && (
-               <div className="border-b border-border/50">
-                   {rootGroups.map(g => renderGroup(g))}
-               </div>
-           )}
-
-           {/* ROOT ASSETS SECTION */}
-           {rootLayers.length > 0 && (
-               <div>
-                   {rootGroups.length > 0 && (
-                       <div className="px-4 py-2 bg-surface/50 border-b border-border/50 text-[10px] font-mono uppercase tracking-widest text-secondary flex items-center gap-2">
-                           <FileImage size={10} /> Source Assets
-                       </div>
-                   )}
-                   
-                   {rootLayers.map(layer => {
-                     const isActive = activeAssetId === layer.id;
-                     const isSelected = selectedLibraryIds.has(layer.id);
-                     const isDragTarget = dragTargetId === layer.id;
-                     const isMenuOpen = activeMenuGroupId === layer.id;
-                     
-                     return (
-                        <div 
-                          key={layer.id}
-                          draggable={!isSelectionMode}
-                          onDragStart={(e) => handleLibraryDragStart(e, layer.id)}
-                          onDragOver={(e) => handleLibraryDragOverItem(e, layer.id)}
-                          onDrop={(e) => handleLibraryDropItem(e, layer.id, false)}
-                          onClick={() => {
-                            if (isSelectionMode) toggleSelection(layer.id);
-                            else { setActiveAssetId(layer.id); setActiveTab('editor'); }
-                          }}
-                          className={`
-                            relative p-3 cursor-pointer transition-all border-b border-border/50 group
-                            ${isActive ? 'bg-accentDim' : 'hover:bg-surface'}
-                            ${isSelected ? 'bg-accent/5' : ''}
-                            ${isDragTarget ? 'ring-2 ring-accent ring-inset bg-accent/5' : ''}
-                          `}
-                        >
-                            {isDragTarget && (
-                                 <div className="absolute inset-0 z-50 pointer-events-none flex items-center justify-center bg-accent/10">
-                                    <span className="text-accent font-bold text-xs bg-background px-2 py-1 rounded shadow-sm">
-                                        Release to Group
-                                    </span>
-                                 </div>
-                            )}
-
-                           <div className="flex gap-3 items-center">
-                               <div className="w-10 h-10 bg-surface border border-border overflow-hidden flex-shrink-0 relative shadow-sm rounded-sm">
-                                 <img src={layer.src} className="w-full h-full object-cover" alt="" />
-                               </div>
-                               
-                               <div className="flex-1 min-w-0">
-                                 <h4 className={`font-medium text-xs truncate ${isActive ? 'text-accent' : 'text-primary'}`}>
-                                   {layer.name}
-                                 </h4>
-                                 <div className="flex items-center gap-2 mt-0.5">
-                                   <span className="font-mono text-[9px] text-secondary bg-surface px-1.5 border border-border rounded-sm">
-                                     {layer.width}×{layer.height}
-                                   </span>
-                                 </div>
-                               </div>
-                               
-                               {!isSelectionMode && (
-                                   <div className={`opacity-0 group-hover:opacity-100 transition-opacity ${isActive || isMenuOpen ? 'opacity-100' : ''}`}>
-                                        <div className="relative">
-                                            <button 
-                                                onClick={(e) => { e.stopPropagation(); setActiveMenuGroupId(isMenuOpen ? null : layer.id); }}
-                                                className={`p-1.5 rounded hover:bg-border/50 text-secondary ${isMenuOpen ? 'text-primary' : ''}`}
-                                            >
-                                                <MoreVertical size={14} />
-                                            </button>
-                                            {isMenuOpen && (
-                                                <div className="absolute right-0 top-8 w-32 bg-background border border-border shadow-elevated rounded-md overflow-hidden z-50 animate-fade-in">
-                                                    <button 
-                                                        onClick={(e) => { e.stopPropagation(); handleDeleteItem(layer.id, 'layer'); }}
-                                                        className="w-full text-left px-3 py-2 text-xs hover:bg-red-50 text-red-500 flex items-center gap-2"
-                                                    >
-                                                        <Trash2 size={12} /> Delete
-                                                    </button>
-                                                </div>
-                                            )}
-                                        </div>
-                                   </div>
-                               )}
-                               
-                               {isSelectionMode ? (
-                                   <div className={`w-4 h-4 rounded border flex items-center justify-center ${isSelected ? 'bg-accent border-accent text-white' : 'border-secondary'}`}>
-                                       {isSelected && <CheckSquare size={12} />}
-                                   </div>
-                               ) : isActive && <div className="w-1.5 h-1.5 rounded-full bg-accent"></div>}
-                           </div>
-                        </div>
-                     );
-                   })}
-               </div>
-           )}
-        </div>
-        
-        <div className="p-6 bg-surface border-t border-border transition-colors duration-300">
-             <h5 className="font-mono text-[10px] uppercase tracking-widest text-secondary mb-2">System Status</h5>
-             <div className="flex items-center gap-2">
-                 <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                 <span className="text-xs font-medium text-primary">Live Sync Active</span>
-             </div>
-        </div>
+        {activeTab === 'smartStitch' ? (
+          <SmartStitchExplorer
+            sessions={smartStitchSessions}
+            activeSessionId={activeSmartStitchSession?.id ?? null}
+            onSelectSession={setActiveSmartStitchSessionId}
+            onCreateSession={handleCreateSmartStitchSession}
+            onDeleteSession={handleDeleteSmartStitchSession}
+          />
+        ) : (
+          <LibraryPanel
+            isSelectionMode={isSelectionMode}
+            selectedLibraryIds={selectedLibraryIds}
+            layers={layers}
+            rootGroups={rootGroups}
+            rootLayers={rootLayers}
+            activeAssetId={activeAssetId}
+            dragTargetId={dragTargetId}
+            activeMenuGroupId={activeMenuGroupId}
+            fileInputRef={fileInputRef}
+            renderGroup={renderGroup}
+            handleCreateGroup={handleCreateGroup}
+            handleDeleteSelected={handleDeleteSelected}
+            setIsSelectionMode={setIsSelectionMode}
+            setSelectedLibraryIds={setSelectedLibraryIds}
+            handleFileUpload={handleFileUpload}
+            handleLibraryDragStart={handleLibraryDragStart}
+            handleLibraryDragOverItem={handleLibraryDragOverItem}
+            handleLibraryDropItem={handleLibraryDropItem}
+            toggleSelection={toggleSelection}
+            setActiveAssetId={setActiveAssetId}
+            setActiveTab={setActiveTab}
+            setActiveMenuGroupId={setActiveMenuGroupId}
+            handleDeleteItem={handleDeleteItem}
+          />
+        )}
       </aside>
       )}
 
@@ -959,6 +927,377 @@ function App() {
 }
 
 // --- Helper Components ---
+
+type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'colors';
+
+interface LibraryPanelProps {
+    isSelectionMode: boolean;
+    selectedLibraryIds: Set<string>;
+    layers: ImageLayer[];
+    rootGroups: AssetGroup[];
+    rootLayers: ImageLayer[];
+    activeAssetId: string | null;
+    dragTargetId: string | null;
+    activeMenuGroupId: string | null;
+    fileInputRef: React.RefObject<HTMLInputElement | null>;
+    renderGroup: (group: AssetGroup, level?: number) => React.ReactNode;
+    handleCreateGroup: () => void;
+    handleDeleteSelected: () => void;
+    setIsSelectionMode: React.Dispatch<React.SetStateAction<boolean>>;
+    setSelectedLibraryIds: React.Dispatch<React.SetStateAction<Set<string>>>;
+    handleFileUpload: (e: React.ChangeEvent<HTMLInputElement>) => void;
+    handleLibraryDragStart: (e: React.DragEvent, id: string) => void;
+    handleLibraryDragOverItem: (e: React.DragEvent, id: string) => void;
+    handleLibraryDropItem: (e: React.DragEvent, targetId: string, isTargetGroup: boolean) => void;
+    toggleSelection: (id: string) => void;
+    setActiveAssetId: React.Dispatch<React.SetStateAction<string | null>>;
+    setActiveTab: React.Dispatch<React.SetStateAction<MainTab>>;
+    setActiveMenuGroupId: React.Dispatch<React.SetStateAction<string | null>>;
+    handleDeleteItem: (id: string, type: 'group' | 'layer') => void;
+}
+
+const LibraryPanel: React.FC<LibraryPanelProps> = ({
+    isSelectionMode,
+    selectedLibraryIds,
+    layers,
+    rootGroups,
+    rootLayers,
+    activeAssetId,
+    dragTargetId,
+    activeMenuGroupId,
+    fileInputRef,
+    renderGroup,
+    handleCreateGroup,
+    handleDeleteSelected,
+    setIsSelectionMode,
+    setSelectedLibraryIds,
+    handleFileUpload,
+    handleLibraryDragStart,
+    handleLibraryDragOverItem,
+    handleLibraryDropItem,
+    toggleSelection,
+    setActiveAssetId,
+    setActiveTab,
+    setActiveMenuGroupId,
+    handleDeleteItem,
+}) => (
+    <>
+      <div className="h-20 flex items-center justify-between px-6 border-b border-border bg-background/50 backdrop-blur-sm">
+         {!isSelectionMode ? (
+            <>
+              <div>
+                  <span className="font-mono text-[10px] text-accent tracking-widest uppercase block mb-1">LIBRARY</span>
+                  <span className="font-serif text-lg text-primary flex items-center gap-2 transition-colors duration-300">
+                      Assets <span className="font-sans text-xs text-secondary font-normal">({layers.length})</span>
+                  </span>
+              </div>
+              <div className="flex gap-2">
+                  <button 
+                      onClick={() => setIsSelectionMode(true)}
+                      className="w-10 h-10 flex items-center justify-center text-secondary hover:text-primary hover:bg-surface transition-colors rounded-full"
+                      title="Select Items"
+                  >
+                      <CheckSquare size={20} />
+                  </button>
+                  <button 
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-10 h-10 flex items-center justify-center bg-inverse text-inverseText hover:bg-accent hover:text-white transition-colors shadow-lg rounded-full"
+                      title="Upload"
+                  >
+                      <Plus size={20} />
+                  </button>
+              </div>
+            </>
+         ) : (
+             <div className="flex-1 flex items-center justify-between animate-fade-in">
+                 <span className="font-mono text-xs text-accent font-bold">{selectedLibraryIds.size} SELECTED</span>
+                 
+                 <div className="flex items-center gap-2">
+                     {selectedLibraryIds.size >= 2 && (
+                         <button 
+                             onClick={handleCreateGroup}
+                             className="h-9 px-3 bg-accent text-white rounded-md text-xs font-bold flex items-center gap-2 hover:bg-orange-600 transition-colors"
+                         >
+                             <Group size={16} /> Group
+                         </button>
+                     )}
+                     
+                     {selectedLibraryIds.size > 0 && (
+                         <button 
+                             onClick={handleDeleteSelected}
+                             className="h-9 w-9 bg-red-500/10 text-red-500 rounded-md flex items-center justify-center hover:bg-red-500 hover:text-white transition-colors"
+                         >
+                             <Trash2 size={16} />
+                         </button>
+                     )}
+                     
+                     <button 
+                          onClick={() => { setIsSelectionMode(false); setSelectedLibraryIds(new Set()); }}
+                          className="h-9 w-9 text-secondary hover:text-primary rounded-md flex items-center justify-center"
+                     >
+                          <X size={20} />
+                     </button>
+                 </div>
+             </div>
+         )}
+         <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept="image/*" multiple />
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-0 scroll-smooth">
+         {rootGroups.length === 0 && rootLayers.length === 0 && (
+           <div className="p-10 text-center border-b border-border border-dashed m-6">
+              <span className="text-xs text-secondary uppercase tracking-wider">Empty State</span>
+           </div>
+         )}
+
+         {rootGroups.length > 0 && (
+             <div className="border-b border-border/50">
+                 {rootGroups.map(g => renderGroup(g))}
+             </div>
+         )}
+
+         {rootLayers.length > 0 && (
+             <div>
+                 {rootGroups.length > 0 && (
+                     <div className="px-4 py-2 bg-surface/50 border-b border-border/50 text-[10px] font-mono uppercase tracking-widest text-secondary flex items-center gap-2">
+                         <FileImage size={10} /> Source Assets
+                     </div>
+                 )}
+                 
+                 {rootLayers.map(layer => {
+                   const isActive = activeAssetId === layer.id;
+                   const isSelected = selectedLibraryIds.has(layer.id);
+                   const isDragTarget = dragTargetId === layer.id;
+                   const isMenuOpen = activeMenuGroupId === layer.id;
+                   
+                   return (
+                      <div 
+                        key={layer.id}
+                        draggable={!isSelectionMode}
+                        onDragStart={(e) => handleLibraryDragStart(e, layer.id)}
+                        onDragOver={(e) => handleLibraryDragOverItem(e, layer.id)}
+                        onDrop={(e) => handleLibraryDropItem(e, layer.id, false)}
+                        onClick={() => {
+                          if (isSelectionMode) toggleSelection(layer.id);
+                          else { setActiveAssetId(layer.id); setActiveTab('editor'); }
+                        }}
+                        className={`
+                          relative p-3 cursor-pointer transition-all border-b border-border/50 group
+                          ${isActive ? 'bg-accentDim' : 'hover:bg-surface'}
+                          ${isSelected ? 'bg-accent/5' : ''}
+                          ${isDragTarget ? 'ring-2 ring-accent ring-inset bg-accent/5' : ''}
+                        `}
+                      >
+                          {isDragTarget && (
+                               <div className="absolute inset-0 z-50 pointer-events-none flex items-center justify-center bg-accent/10">
+                                  <span className="text-accent font-bold text-xs bg-background px-2 py-1 rounded shadow-sm">
+                                      Release to Group
+                                  </span>
+                               </div>
+                          )}
+
+                         <div className="flex gap-3 items-center">
+                             <div className="w-10 h-10 bg-surface border border-border overflow-hidden flex-shrink-0 relative shadow-sm rounded-sm">
+                               <img src={layer.src} className="w-full h-full object-cover" alt="" />
+                             </div>
+                             
+                             <div className="flex-1 min-w-0">
+                               <h4 className={`font-medium text-xs truncate ${isActive ? 'text-accent' : 'text-primary'}`}>
+                                 {layer.name}
+                               </h4>
+                               <div className="flex items-center gap-2 mt-0.5">
+                                 <span className="font-mono text-[9px] text-secondary bg-surface px-1.5 border border-border rounded-sm">
+                                   {layer.width}×{layer.height}
+                                 </span>
+                               </div>
+                             </div>
+                             
+                             {!isSelectionMode && (
+                                 <div className={`opacity-0 group-hover:opacity-100 transition-opacity ${isActive || isMenuOpen ? 'opacity-100' : ''}`}>
+                                      <div className="relative">
+                                          <button 
+                                              onClick={(e) => { e.stopPropagation(); setActiveMenuGroupId(isMenuOpen ? null : layer.id); }}
+                                              className={`p-1.5 rounded hover:bg-border/50 text-secondary ${isMenuOpen ? 'text-primary' : ''}`}
+                                          >
+                                              <MoreVertical size={14} />
+                                          </button>
+                                          {isMenuOpen && (
+                                              <div className="absolute right-0 top-8 w-32 bg-background border border-border shadow-elevated rounded-md overflow-hidden z-50 animate-fade-in">
+                                                  <button 
+                                                      onClick={(e) => { e.stopPropagation(); handleDeleteItem(layer.id, 'layer'); }}
+                                                      className="w-full text-left px-3 py-2 text-xs hover:bg-red-50 text-red-500 flex items-center gap-2"
+                                                  >
+                                                      <Trash2 size={12} /> Delete
+                                                  </button>
+                                              </div>
+                                          )}
+                                      </div>
+                                 </div>
+                             )}
+                             
+                             {isSelectionMode ? (
+                                 <div className={`w-4 h-4 rounded border flex items-center justify-center ${isSelected ? 'bg-accent border-accent text-white' : 'border-secondary'}`}>
+                                     {isSelected && <CheckSquare size={12} />}
+                                 </div>
+                             ) : isActive && <div className="w-1.5 h-1.5 rounded-full bg-accent"></div>}
+                         </div>
+                      </div>
+                   );
+                 })}
+             </div>
+         )}
+      </div>
+      
+      <div className="p-6 bg-surface border-t border-border transition-colors duration-300">
+           <h5 className="font-mono text-[10px] uppercase tracking-widest text-secondary mb-2">System Status</h5>
+           <div className="flex items-center gap-2">
+               <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+               <span className="text-xs font-medium text-primary">Live Sync Active</span>
+           </div>
+      </div>
+    </>
+);
+
+interface SmartStitchExplorerProps {
+    sessions: SmartStitchSession[];
+    activeSessionId: string | null;
+    onSelectSession: (sessionId: string) => void;
+    onCreateSession: () => void;
+    onDeleteSession: (sessionId: string) => void;
+}
+
+const SmartStitchExplorer: React.FC<SmartStitchExplorerProps> = ({
+    sessions,
+    activeSessionId,
+    onSelectSession,
+    onCreateSession,
+    onDeleteSession,
+}) => {
+    const activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0] ?? null;
+
+    const formatTimestamp = (timestamp: string) => {
+        const parsed = new Date(timestamp);
+        if (Number.isNaN(parsed.getTime())) return 'Saved recently';
+        return parsed.toLocaleString([], {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+        });
+    };
+
+    return (
+        <>
+          <div className="h-20 flex items-center justify-between px-6 border-b border-border bg-background/50 backdrop-blur-sm">
+             <div>
+                 <span className="font-mono text-[10px] text-accent tracking-widest uppercase block mb-1">STITCH FILES</span>
+                 <span className="font-serif text-lg text-primary flex items-center gap-2 transition-colors duration-300">
+                     Saved Stitches <span className="font-sans text-xs text-secondary font-normal">({sessions.length})</span>
+                 </span>
+             </div>
+             <button
+                onClick={onCreateSession}
+                className="h-10 px-3 bg-inverse text-inverseText hover:bg-accent hover:text-white transition-colors shadow-lg rounded-full flex items-center gap-2 text-xs font-medium"
+                title="Start New Stitch"
+             >
+                <CopyPlus size={16} />
+                Start New
+             </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto">
+             <div className="p-4 border-b border-border bg-surface/40">
+                 <span className="font-mono text-[10px] uppercase tracking-widest text-secondary">Session Explorer</span>
+             </div>
+
+             <div className="divide-y divide-border/50">
+                {sessions.map((session) => {
+                    const isActive = session.id === activeSessionId;
+                    const preview = session.images[0]?.dataUrl ?? null;
+                    return (
+                        <button
+                            key={session.id}
+                            onClick={() => onSelectSession(session.id)}
+                            className={`w-full text-left p-4 transition-colors ${isActive ? 'bg-accentDim/40' : 'hover:bg-surface'}`}
+                        >
+                            <div className="flex items-start gap-3">
+                                <div className="w-14 h-14 rounded-lg overflow-hidden border border-border bg-surface flex-shrink-0">
+                                    {preview ? (
+                                        <img src={preview} alt="" className="w-full h-full object-cover" />
+                                    ) : (
+                                        <div className="w-full h-full flex items-center justify-center text-secondary">
+                                            <ImageIcon size={16} />
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-center justify-between gap-2">
+                                        <h4 className={`text-sm truncate ${isActive ? 'text-accent font-medium' : 'text-primary'}`}>
+                                            {session.name}
+                                        </h4>
+                                        {sessions.length > 1 && (
+                                            <span
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    onDeleteSession(session.id);
+                                                }}
+                                                className="p-1 rounded hover:bg-red-500/10 hover:text-red-500 text-secondary"
+                                            >
+                                                <Trash2 size={14} />
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="mt-1 flex items-center gap-2 text-[10px] font-mono uppercase tracking-wider text-secondary">
+                                        <span>{session.images.length} images</span>
+                                        <span className="w-1 h-1 rounded-full bg-border"></span>
+                                        <span>{formatTimestamp(session.updatedAt)}</span>
+                                    </div>
+                                    <div className="mt-2 flex items-center gap-2 text-[10px] text-secondary">
+                                        <span className="rounded-sm border border-border px-1.5 py-0.5">
+                                            {session.settings.containerWidth}px
+                                        </span>
+                                        <span className="rounded-sm border border-border px-1.5 py-0.5">
+                                            {Math.round(session.settings.exportScale * 100)}%
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </button>
+                    );
+                })}
+             </div>
+
+             <div className="p-4 border-t border-border bg-surface/20">
+                <div className="flex items-center gap-2 mb-3">
+                    <ImageIcon size={14} className="text-accent" />
+                    <span className="font-mono text-[10px] uppercase tracking-widest text-accent">Current Files</span>
+                </div>
+                {activeSession && activeSession.images.length > 0 ? (
+                    <div className="space-y-2">
+                        {activeSession.images.map((image) => (
+                            <div key={image.id} className="flex items-center gap-3 rounded-xl border border-border bg-background px-3 py-2">
+                                <div className="w-10 h-10 rounded-md overflow-hidden border border-border bg-surface flex-shrink-0">
+                                    <img src={image.dataUrl} alt="" className="w-full h-full object-cover" />
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="text-xs text-primary truncate">{image.name}</div>
+                                    <div className="text-[10px] font-mono uppercase tracking-wider text-secondary">
+                                        {image.width}×{image.height}
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                ) : (
+                    <div className="rounded-2xl border border-dashed border-border p-5 text-center text-xs text-secondary">
+                        Start a new stitch, add images, then switch back here any time.
+                    </div>
+                )}
+             </div>
+          </div>
+        </>
+    );
+};
 
 const GroupStitchView: React.FC<{ 
     group: AssetGroup, 

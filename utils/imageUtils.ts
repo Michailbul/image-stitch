@@ -1,5 +1,142 @@
 import { CropRegion, ImageLayer, SmartStitchImage, SmartStitchLayoutItem } from '../types';
 
+export interface ExportScaleOption {
+  label: string;
+  value: number;
+}
+
+export const EXPORT_SCALE_OPTIONS: ExportScaleOption[] = [
+  { label: '100%', value: 1 },
+  { label: '75%', value: 0.75 },
+  { label: '50%', value: 0.5 },
+  { label: '25%', value: 0.25 },
+];
+
+interface HorizontalStitchLayoutItem {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface HorizontalStitchLayout {
+  width: number;
+  height: number;
+  items: HorizontalStitchLayoutItem[];
+}
+
+const clampExportScale = (scale = 1): number => {
+  if (!Number.isFinite(scale)) return 1;
+  return Math.min(1, Math.max(0.1, scale));
+};
+
+const prepareCanvasContext = (canvas: HTMLCanvasElement): CanvasRenderingContext2D => {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Could not get canvas context');
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  return ctx;
+};
+
+export const calculateHorizontalStitchLayout = (
+  imageSizes: Array<{ width: number; height: number }>,
+  options?: { exportScale?: number }
+): HorizontalStitchLayout => {
+  if (imageSizes.length === 0) {
+    return { width: 0, height: 0, items: [] };
+  }
+
+  const exportScale = clampExportScale(options?.exportScale);
+  const baseHeight = Math.max(...imageSizes.map((image) => image.height));
+  const height = Math.max(1, Math.ceil(baseHeight * exportScale));
+
+  let totalWidth = 0;
+  const items = imageSizes.map((image) => {
+    const width = image.width * exportScale;
+    const itemHeight = image.height * exportScale;
+    const item: HorizontalStitchLayoutItem = {
+      x: totalWidth,
+      y: (height - itemHeight) / 2,
+      width,
+      height: itemHeight,
+    };
+    totalWidth += width;
+    return item;
+  });
+
+  return {
+    width: Math.max(1, Math.ceil(totalWidth)),
+    height,
+    items,
+  };
+};
+
+export const calculateSmartStitchLayout = (
+  images: SmartStitchImage[],
+  settings: { containerWidth: number; targetRowHeight: number; spacing: number }
+): { layout: SmartStitchLayoutItem[]; width: number; height: number } => {
+  if (images.length === 0) {
+    return { layout: [], width: 0, height: 0 };
+  }
+
+  const { containerWidth, targetRowHeight, spacing } = settings;
+
+  let rows: { img: SmartStitchImage; aspectRatio: number; scaledWidth: number }[][] = [];
+  let currentRow: { img: SmartStitchImage; aspectRatio: number; scaledWidth: number }[] = [];
+  let currentWidth = 0;
+
+  for (const image of images) {
+    const aspectRatio = image.width / image.height;
+    const scaledWidth = targetRowHeight * aspectRatio;
+
+    currentRow.push({ img: image, aspectRatio, scaledWidth });
+    currentWidth += scaledWidth;
+
+    const totalWidthWithSpacing = currentWidth + (currentRow.length - 1) * spacing;
+    if (totalWidthWithSpacing >= containerWidth) {
+      rows.push(currentRow);
+      currentRow = [];
+      currentWidth = 0;
+    }
+  }
+
+  if (currentRow.length > 0) {
+    rows.push(currentRow);
+  }
+
+  const layout: SmartStitchLayoutItem[] = [];
+  let y = spacing;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const isLastRow = i === rows.length - 1;
+    const rowAspectRatio = row.reduce((sum, item) => sum + item.aspectRatio, 0);
+    const availableWidth = containerWidth - spacing * 2 - (row.length - 1) * spacing;
+
+    let rowHeight: number;
+    if (isLastRow && row.length > 0 && rowAspectRatio < (availableWidth / targetRowHeight) * 0.6) {
+      rowHeight = targetRowHeight;
+    } else {
+      rowHeight = availableWidth / rowAspectRatio;
+    }
+
+    let x = spacing;
+    for (const item of row) {
+      const width = rowHeight * item.aspectRatio;
+      layout.push({ img: item.img, x, y, width, height: rowHeight });
+      x += width + spacing;
+    }
+    y += rowHeight + spacing;
+  }
+
+  return {
+    layout,
+    width: Math.max(1, Math.ceil(containerWidth)),
+    height: Math.max(1, Math.ceil(y)),
+  };
+};
+
 /**
  * Loads an image from a source string.
  */
@@ -36,9 +173,7 @@ export const cropImage = async (
   canvas.width = Math.max(1, Math.round(pxW));
   canvas.height = Math.max(1, Math.round(pxH));
   
-  const ctx = canvas.getContext('2d');
-
-  if (!ctx) throw new Error('Could not get canvas context');
+  const ctx = prepareCanvasContext(canvas);
 
   // Draw the portion of the image
   ctx.drawImage(img, pxX, pxY, pxW, pxH, 0, 0, canvas.width, canvas.height);
@@ -53,9 +188,7 @@ export const generateCompositeImage = async (layer: ImageLayer): Promise<string>
   const canvas = document.createElement('canvas');
   canvas.width = layer.width;
   canvas.height = layer.height;
-  const ctx = canvas.getContext('2d');
-  
-  if (!ctx) throw new Error('Could not get canvas context');
+  const ctx = prepareCanvasContext(canvas);
 
   // Draw base
   ctx.drawImage(baseImg, 0, 0);
@@ -88,7 +221,7 @@ export const loadImageFile = (file: File): Promise<SmartStitchImage> => {
       img.onload = () => {
         resolve({
           id: Math.random().toString(36).substring(2, 9),
-          file,
+          name: file.name,
           dataUrl,
           width: img.width,
           height: img.height,
@@ -108,69 +241,25 @@ export const loadImageFile = (file: File): Promise<SmartStitchImage> => {
  */
 export const generateSmartStitch = async (
   images: SmartStitchImage[],
-  settings: { containerWidth: number; targetRowHeight: number; spacing: number; backgroundColor: string }
+  settings: {
+    containerWidth: number;
+    targetRowHeight: number;
+    spacing: number;
+    backgroundColor: string;
+    exportScale?: number;
+  }
 ): Promise<string> => {
   if (images.length === 0) return '';
 
-  const { containerWidth, targetRowHeight, spacing, backgroundColor } = settings;
-
-  // Build rows based on aspect ratios
-  let rows: { img: SmartStitchImage; aspectRatio: number; scaledWidth: number }[][] = [];
-  let currentRow: { img: SmartStitchImage; aspectRatio: number; scaledWidth: number }[] = [];
-  let currentWidth = 0;
-
-  for (const image of images) {
-    const aspectRatio = image.width / image.height;
-    const scaledWidth = targetRowHeight * aspectRatio;
-
-    currentRow.push({ img: image, aspectRatio, scaledWidth });
-    currentWidth += scaledWidth;
-
-    const totalWidthWithSpacing = currentWidth + (currentRow.length - 1) * spacing;
-    if (totalWidthWithSpacing >= containerWidth) {
-      rows.push(currentRow);
-      currentRow = [];
-      currentWidth = 0;
-    }
-  }
-  if (currentRow.length > 0) {
-    rows.push(currentRow);
-  }
-
-  // Calculate layout positions
-  const layout: SmartStitchLayoutItem[] = [];
-  let y = spacing;
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const isLastRow = i === rows.length - 1;
-    const rowAspectRatio = row.reduce((sum, item) => sum + item.aspectRatio, 0);
-    const availableWidth = containerWidth - spacing * 2 - (row.length - 1) * spacing;
-
-    let rowHeight: number;
-    if (isLastRow && row.length > 0 && rowAspectRatio < (availableWidth / targetRowHeight) * 0.6) {
-      rowHeight = targetRowHeight;
-    } else {
-      rowHeight = availableWidth / rowAspectRatio;
-    }
-
-    let x = spacing;
-    for (const item of row) {
-      const width = rowHeight * item.aspectRatio;
-      layout.push({ img: item.img, x, y, width, height: rowHeight });
-      x += width + spacing;
-    }
-    y += rowHeight + spacing;
-  }
-
-  const totalHeight = y;
+  const { backgroundColor } = settings;
+  const exportScale = clampExportScale(settings.exportScale);
+  const { layout, width, height } = calculateSmartStitchLayout(images, settings);
 
   // Draw to canvas
   const canvas = document.createElement('canvas');
-  canvas.width = containerWidth;
-  canvas.height = totalHeight;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return '';
+  canvas.width = Math.max(1, Math.ceil(width * exportScale));
+  canvas.height = Math.max(1, Math.ceil(height * exportScale));
+  const ctx = prepareCanvasContext(canvas);
 
   ctx.fillStyle = backgroundColor;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -180,7 +269,13 @@ export const generateSmartStitch = async (
       new Promise<void>((resolve) => {
         const img = new Image();
         img.onload = () => {
-          ctx.drawImage(img, item.x, item.y, item.width, item.height);
+          ctx.drawImage(
+            img,
+            item.x * exportScale,
+            item.y * exportScale,
+            item.width * exportScale,
+            item.height * exportScale
+          );
           resolve();
         };
         img.src = item.img.dataUrl;
@@ -196,39 +291,28 @@ export const generateSmartStitch = async (
  * Scales all images to the height of the tallest image to ensure perfect alignment.
  */
 export const generateStitchedCanvas = async (
-  items: string[]
+  items: string[],
+  options?: { exportScale?: number }
 ): Promise<string> => {
   if (items.length === 0) return '';
 
   const loadedImages = await Promise.all(items.map(src => loadImage(src)));
-
-  // 1. Find the maximum height among all images
-  const maxHeight = Math.max(...loadedImages.map(img => img.height));
-
-  // 2. Calculate scaled widths and total width
-  let totalWidth = 0;
-  const dimensions = loadedImages.map(img => {
-    // Aspect Ratio = Width / Height
-    // New Width = Aspect Ratio * Target Height
-    const aspectRatio = img.width / img.height;
-    const newWidth = aspectRatio * maxHeight;
-    totalWidth += newWidth;
-    return { img, width: newWidth, height: maxHeight };
-  });
+  const layout = calculateHorizontalStitchLayout(
+    loadedImages.map((img) => ({ width: img.width, height: img.height })),
+    options
+  );
 
   // 3. Create Canvas
   const canvas = document.createElement('canvas');
-  canvas.width = Math.ceil(totalWidth);
-  canvas.height = Math.ceil(maxHeight);
-  const ctx = canvas.getContext('2d');
-
-  if (!ctx) throw new Error('Could not get canvas context');
+  canvas.width = layout.width;
+  canvas.height = layout.height;
+  const ctx = prepareCanvasContext(canvas);
 
   // 4. Draw Images
-  let currentX = 0;
-  for (const dim of dimensions) {
-    ctx.drawImage(dim.img, currentX, 0, dim.width, dim.height);
-    currentX += dim.width;
+  for (let index = 0; index < loadedImages.length; index += 1) {
+    const item = layout.items[index];
+    const img = loadedImages[index];
+    ctx.drawImage(img, item.x, item.y, item.width, item.height);
   }
 
   return canvas.toDataURL('image/png');

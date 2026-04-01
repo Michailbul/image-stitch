@@ -1,21 +1,18 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, RefreshCw, Download, Trash2, Settings2 } from 'lucide-react';
-import { SmartStitchImage } from '../types';
-import { loadImageFile, generateSmartStitch } from '../utils/imageUtils';
+import { SmartStitchSession } from '../types';
+import { loadImageFile, generateSmartStitch, EXPORT_SCALE_OPTIONS } from '../utils/imageUtils';
 
-export default function SmartStitchView() {
-  const [images, setImages] = useState<SmartStitchImage[]>([]);
+interface SmartStitchViewProps {
+  session: SmartStitchSession;
+  onUpdateSession: (nextSession: SmartStitchSession) => void;
+}
+
+export default function SmartStitchView({ session, onUpdateSession }: SmartStitchViewProps) {
   const [stitchedDataUrl, setStitchedDataUrl] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
-
-  const [settings, setSettings] = useState({
-    containerWidth: 1200,
-    targetRowHeight: 300,
-    spacing: 12,
-    backgroundColor: '#ffffff',
-  });
-
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { images, settings } = session;
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
@@ -23,7 +20,11 @@ export default function SmartStitchView() {
     setIsProcessing(true);
     try {
       const newImages = await Promise.all(files.map(loadImageFile));
-      setImages((prev) => [...prev, ...newImages]);
+      onUpdateSession({
+        ...session,
+        images: [...session.images, ...newImages],
+        updatedAt: new Date().toISOString(),
+      });
     } catch (error) {
       console.error('Error loading images', error);
     } finally {
@@ -33,11 +34,19 @@ export default function SmartStitchView() {
   };
 
   const removeImage = (id: string) => {
-    setImages((prev) => prev.filter((img) => img.id !== id));
+    onUpdateSession({
+      ...session,
+      images: session.images.filter((img) => img.id !== id),
+      updatedAt: new Date().toISOString(),
+    });
   };
 
   const handleShuffle = () => {
-    setImages((prev) => [...prev].sort(() => Math.random() - 0.5));
+    onUpdateSession({
+      ...session,
+      images: [...session.images].sort(() => Math.random() - 0.5),
+      updatedAt: new Date().toISOString(),
+    });
   };
 
   const runStitch = useCallback(async () => {
@@ -74,7 +83,13 @@ export default function SmartStitchView() {
             <div className="h-px flex-1 bg-border"></div>
             {images.length > 0 && (
               <button
-                onClick={() => setImages([])}
+                onClick={() =>
+                  onUpdateSession({
+                    ...session,
+                    images: [],
+                    updatedAt: new Date().toISOString(),
+                  })
+                }
                 className="font-mono text-[10px] text-secondary hover:text-accent transition-colors uppercase"
               >
                 Clear
@@ -135,7 +150,7 @@ export default function SmartStitchView() {
           <div className="flex flex-col gap-5 bg-surface rounded-xl p-5 border border-border">
             <label className="flex flex-col gap-2">
               <div className="flex justify-between font-mono text-[10px] uppercase tracking-wider">
-                <span className="text-primary">Output Width</span>
+                <span className="text-primary">Layout Width</span>
                 <span className="text-secondary">{settings.containerWidth}px</span>
               </div>
               <input
@@ -144,7 +159,13 @@ export default function SmartStitchView() {
                 max="2400"
                 step="100"
                 value={settings.containerWidth}
-                onChange={(e) => setSettings((s) => ({ ...s, containerWidth: Number(e.target.value) }))}
+                onChange={(e) =>
+                  onUpdateSession({
+                    ...session,
+                    settings: { ...session.settings, containerWidth: Number(e.target.value) },
+                    updatedAt: new Date().toISOString(),
+                  })
+                }
                 className="range-clean"
               />
             </label>
@@ -160,7 +181,13 @@ export default function SmartStitchView() {
                 max="800"
                 step="50"
                 value={settings.targetRowHeight}
-                onChange={(e) => setSettings((s) => ({ ...s, targetRowHeight: Number(e.target.value) }))}
+                onChange={(e) =>
+                  onUpdateSession({
+                    ...session,
+                    settings: { ...session.settings, targetRowHeight: Number(e.target.value) },
+                    updatedAt: new Date().toISOString(),
+                  })
+                }
                 className="range-clean"
               />
             </label>
@@ -176,7 +203,13 @@ export default function SmartStitchView() {
                 max="100"
                 step="2"
                 value={settings.spacing}
-                onChange={(e) => setSettings((s) => ({ ...s, spacing: Number(e.target.value) }))}
+                onChange={(e) =>
+                  onUpdateSession({
+                    ...session,
+                    settings: { ...session.settings, spacing: Number(e.target.value) },
+                    updatedAt: new Date().toISOString(),
+                  })
+                }
                 className="range-clean"
               />
             </label>
@@ -187,17 +220,60 @@ export default function SmartStitchView() {
                 <input
                   type="color"
                   value={settings.backgroundColor}
-                  onChange={(e) => setSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
+                  onChange={(e) =>
+                    onUpdateSession({
+                      ...session,
+                      settings: { ...session.settings, backgroundColor: e.target.value },
+                      updatedAt: new Date().toISOString(),
+                    })
+                  }
                   className="w-12 h-full cursor-pointer border-r border-border p-0 bg-surface"
                 />
                 <input
                   type="text"
                   value={settings.backgroundColor}
-                  onChange={(e) => setSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
+                  onChange={(e) =>
+                    onUpdateSession({
+                      ...session,
+                      settings: { ...session.settings, backgroundColor: e.target.value },
+                      updatedAt: new Date().toISOString(),
+                    })
+                  }
                   className="flex-1 px-3 font-mono text-xs uppercase bg-background outline-none text-primary"
                 />
               </div>
             </label>
+
+            <div className="flex flex-col gap-3">
+              <div className="flex justify-between font-mono text-[10px] uppercase tracking-wider">
+                <span className="text-primary">Export Size</span>
+                <span className="text-secondary">{Math.round(settings.exportScale * 100)}%</span>
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                {EXPORT_SCALE_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    onClick={() =>
+                      onUpdateSession({
+                        ...session,
+                        settings: { ...session.settings, exportScale: option.value },
+                        updatedAt: new Date().toISOString(),
+                      })
+                    }
+                    className={`rounded-xl border px-2 py-2 text-xs font-medium transition-colors ${
+                      settings.exportScale === option.value
+                        ? 'border-accent bg-accent text-white'
+                        : 'border-border bg-background text-secondary hover:text-primary hover:border-accent'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] leading-5 text-secondary">
+                `100%` keeps the stitched canvas at full chosen resolution. Lower sizes reduce file size without changing the layout.
+              </p>
+            </div>
           </div>
         </div>
 
@@ -217,7 +293,7 @@ export default function SmartStitchView() {
             className="w-full py-3 px-4 bg-inverse text-inverseText rounded-xl hover:bg-accent hover:text-white transition-all flex items-center justify-center gap-2 font-medium text-sm disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <Download size={16} />
-            Download
+            Download {Math.round(settings.exportScale * 100)}%
           </button>
         </div>
       </div>

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ImageLayer, StitchItem, AssetGroup } from '../types';
-import { cropImage, generateStitchedCanvas } from '../utils/imageUtils';
+import { cropImage, EXPORT_SCALE_OPTIONS, generateStitchedCanvas } from '../utils/imageUtils';
 import { Trash2, Download, Layers, ArrowLeft, ArrowRight, ArrowLeftRight } from 'lucide-react';
 
 interface StitchViewProps {
@@ -16,6 +16,7 @@ const StitchView: React.FC<StitchViewProps> = ({ layers, groups, stitchItems, se
   const [isArrangeMode, setIsArrangeMode] = useState(false);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
+  const [exportScale, setExportScale] = useState(1);
 
   // Load individual crops first (Supports Layers AND Groups)
   useEffect(() => {
@@ -86,14 +87,14 @@ const StitchView: React.FC<StitchViewProps> = ({ layers, groups, stitchItems, se
         if (sources.length !== stitchItems.length) return; // Wait for all to load
 
         try {
-            const url = await generateStitchedCanvas(sources);
+            const url = await generateStitchedCanvas(sources, { exportScale });
             setStitchedPreviewSrc(url);
         } catch (e) {
             console.error("Stitch generation failed", e);
         }
     };
     generatePreview();
-  }, [stitchItems, renderedImages]);
+  }, [stitchItems, renderedImages, exportScale]);
 
   const handleRemoveItem = (index: number) => {
      setStitchItems(prev => prev.filter((_, i) => i !== index));
@@ -250,13 +251,37 @@ const StitchView: React.FC<StitchViewProps> = ({ layers, groups, stitchItems, se
          
          {/* Download Button (Overlay) */}
          {stitchItems.length > 0 && !isArrangeMode && (
-             <div className="absolute top-6 right-8 z-40">
+             <div className="absolute top-6 right-8 z-40 flex flex-col items-end gap-3">
+                <div className="bg-background/95 border border-border rounded-2xl shadow-md p-3 w-[300px] backdrop-blur">
+                    <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-widest">
+                        <span className="text-primary">Export Size</span>
+                        <span className="text-secondary">{Math.round(exportScale * 100)}%</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2 mt-3">
+                        {EXPORT_SCALE_OPTIONS.map((option) => (
+                            <button
+                                key={option.value}
+                                onClick={() => setExportScale(option.value)}
+                                className={`rounded-xl border px-2 py-2 text-xs font-medium transition-colors ${
+                                    exportScale === option.value
+                                      ? 'border-accent bg-accent text-white'
+                                      : 'border-border bg-background text-secondary hover:text-primary hover:border-accent'
+                                }`}
+                            >
+                                {option.label}
+                            </button>
+                        ))}
+                    </div>
+                    <p className="mt-3 text-[11px] leading-5 text-secondary">
+                        `100%` keeps each image at its native stitched resolution. Lower sizes make the PNG lighter on purpose.
+                    </p>
+                </div>
                 <button 
                 onClick={handleDownloadStitch}
                 className="bg-inverse hover:bg-accent text-inverseText hover:text-white px-6 py-3 text-xs font-mono uppercase tracking-widest flex items-center gap-2 shadow-sharp transition-colors rounded-sm"
                 >
                 <Download size={16} />
-                Download Final
+                Download {Math.round(exportScale * 100)}%
                 </button>
              </div>
          )}

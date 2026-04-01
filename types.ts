@@ -35,10 +35,27 @@ export interface StitchItem {
 
 export interface SmartStitchImage {
   id: string;
-  file: File;
+  name: string;
   dataUrl: string;
   width: number;
   height: number;
+}
+
+export interface SmartStitchSettings {
+  containerWidth: number;
+  targetRowHeight: number;
+  spacing: number;
+  backgroundColor: string;
+  exportScale: number;
+}
+
+export interface SmartStitchSession {
+  id: string;
+  name: string;
+  images: SmartStitchImage[];
+  settings: SmartStitchSettings;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SmartStitchLayoutItem {
