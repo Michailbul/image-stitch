@@ -25,7 +25,7 @@ interface HorizontalStitchLayout {
   items: HorizontalStitchLayoutItem[];
 }
 
-const clampExportScale = (scale = 1): number => {
+export const clampExportScale = (scale = 1): number => {
   if (!Number.isFinite(scale)) return 1;
   return Math.min(1, Math.max(0.1, scale));
 };
@@ -69,6 +69,18 @@ export const calculateHorizontalStitchLayout = (
     width: Math.max(1, Math.ceil(totalWidth)),
     height,
     items,
+  };
+};
+
+export const calculateScaledDimensions = (
+  width: number,
+  height: number,
+  scale = 1
+): { width: number; height: number } => {
+  const exportScale = clampExportScale(scale);
+  return {
+    width: Math.max(1, Math.round(width * exportScale)),
+    height: Math.max(1, Math.round(height * exportScale)),
   };
 };
 
@@ -135,6 +147,23 @@ export const calculateSmartStitchLayout = (
     width: Math.max(1, Math.ceil(containerWidth)),
     height: Math.max(1, Math.ceil(y)),
   };
+};
+
+export const resizeImageSource = async (
+  imageSrc: string,
+  scale = 1
+): Promise<string> => {
+  const exportScale = clampExportScale(scale);
+  if (exportScale === 1) return imageSrc;
+
+  const img = await loadImage(imageSrc);
+  const dimensions = calculateScaledDimensions(img.width, img.height, exportScale);
+  const canvas = document.createElement('canvas');
+  canvas.width = dimensions.width;
+  canvas.height = dimensions.height;
+  const ctx = prepareCanvasContext(canvas);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/png');
 };
 
 /**

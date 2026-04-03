@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { calculateHorizontalStitchLayout, calculateSmartStitchLayout } from './imageUtils';
+import {
+  calculateHorizontalStitchLayout,
+  calculateScaledDimensions,
+  calculateSmartStitchLayout,
+  clampExportScale,
+} from './imageUtils';
 
 describe('calculateHorizontalStitchLayout', () => {
   it('preserves native image dimensions by default instead of upscaling shorter images', () => {
@@ -53,5 +58,18 @@ describe('calculateSmartStitchLayout', () => {
     expect(layout.layout).toHaveLength(2);
     expect(layout.layout[0]).toMatchObject({ x: 12, y: 12, width: 582, height: 388 });
     expect(layout.layout[1]).toMatchObject({ x: 606, y: 12, width: 582, height: 388 });
+  });
+});
+
+describe('export scaling helpers', () => {
+  it('clamps invalid export scale values into a safe range', () => {
+    expect(clampExportScale(Number.NaN)).toBe(1);
+    expect(clampExportScale(4)).toBe(1);
+    expect(clampExportScale(0.01)).toBe(0.1);
+  });
+
+  it('calculates scaled pixel dimensions deterministically', () => {
+    expect(calculateScaledDimensions(1600, 900, 0.5)).toEqual({ width: 800, height: 450 });
+    expect(calculateScaledDimensions(1601, 901, 0.25)).toEqual({ width: 400, height: 225 });
   });
 });

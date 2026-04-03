@@ -9,7 +9,7 @@ import {
     X, 
     Trash2, 
 } from 'lucide-react';
-import { cropImage, generateCompositeImage } from '../utils/imageUtils';
+import { cropImage, EXPORT_SCALE_OPTIONS, generateCompositeImage, resizeImageSource } from '../utils/imageUtils';
 
 interface ImageCropperProps {
   layer: ImageLayer;
@@ -28,6 +28,7 @@ const ImageCropper: React.FC<ImageCropperProps> = ({ layer, onUpdateLayer, onAdd
   useEffect(() => { layerRef.current = layer; }, [layer]);
 
   const [activeCropId, setActiveCropId] = useState<string | null>(null);
+  const [exportScale, setExportScale] = useState(1);
   
   // OPTIMIZATION: Local state for the crop currently being manipulated.
   // This prevents round-tripping to the parent component on every mouse move.
@@ -265,6 +266,10 @@ const ImageCropper: React.FC<ImageCropperProps> = ({ layer, onUpdateLayer, onAdd
       } else {
         url = await cropImage(layer.src, crop, layer.width, layer.height);
       }
+
+      if (exportScale < 1) {
+        url = await resizeImageSource(url, exportScale);
+      }
       
       const a = document.createElement('a');
       a.href = url;
@@ -295,10 +300,13 @@ const ImageCropper: React.FC<ImageCropperProps> = ({ layer, onUpdateLayer, onAdd
   };
 
   const handleDownloadFull = async () => {
-    const url = await generateCompositeImage(layer);
+    let url = await generateCompositeImage(layer);
+    if (exportScale < 1) {
+      url = await resizeImageSource(url, exportScale);
+    }
     const a = document.createElement('a');
     a.href = url;
-    a.download = `composite-${layer.name}.png`;
+    a.download = `composite-${layer.name}-${Math.round(exportScale * 100)}.png`;
     a.click();
   };
 
@@ -313,12 +321,36 @@ const ImageCropper: React.FC<ImageCropperProps> = ({ layer, onUpdateLayer, onAdd
     <div className="relative w-full h-full flex flex-col">
       
       {/* Top Right Action: Editorial Tag */}
-      <div className="absolute top-0 right-0 z-40">
+      <div className="absolute top-0 right-0 z-40 flex flex-col items-end gap-3">
+         <div className="bg-background/95 border border-border rounded-2xl shadow-md p-3 w-[300px] backdrop-blur">
+            <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-widest">
+                <span className="text-primary">Canvas Export</span>
+                <span className="text-secondary">{Math.round(exportScale * 100)}%</span>
+            </div>
+            <div className="grid grid-cols-4 gap-2 mt-3">
+                {EXPORT_SCALE_OPTIONS.map((option) => (
+                    <button
+                        key={option.value}
+                        onClick={() => setExportScale(option.value)}
+                        className={`rounded-xl border px-2 py-2 text-xs font-medium transition-colors ${
+                            exportScale === option.value
+                              ? 'border-accent bg-accent text-white'
+                              : 'border-border bg-background text-secondary hover:text-primary hover:border-accent'
+                        }`}
+                    >
+                        {option.label}
+                    </button>
+                ))}
+            </div>
+            <p className="mt-3 text-[11px] leading-5 text-secondary">
+                `100%` keeps canvas and crop exports at full resolution. Lower sizes reduce file size on purpose.
+            </p>
+         </div>
          <button 
            onClick={handleDownloadFull}
            className="bg-inverse text-inverseText px-5 py-2.5 text-xs font-mono uppercase tracking-widest hover:bg-accent hover:text-white transition-colors shadow-sharp"
          >
-           Save Composition
+           Save Composition {Math.round(exportScale * 100)}%
          </button>
       </div>
 

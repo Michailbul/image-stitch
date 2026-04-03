@@ -3,6 +3,7 @@ import ImageCropper from './components/ImageCropper';
 import StitchView from './views/StitchView';
 import SmartStitchView from './views/SmartStitchView';
 import ColorExplorerView from './views/ColorExplorerView';
+import ResizeView from './views/ResizeView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
 import { ImageLayer, StitchItem, AssetGroup, CropRegion, SmartStitchSession, SmartStitchSettings } from './types';
 import {
@@ -35,7 +36,8 @@ import {
   Eye,
   Image as ImageIcon,
   FileImage,
-  CopyPlus
+  CopyPlus,
+  Minimize2
 } from 'lucide-react';
 
 const SMART_STITCH_STORAGE_KEY = 'laniameda.smart-stitch.sessions.v1';
@@ -92,7 +94,7 @@ const hydrateSmartStitchSessions = (): SmartStitchSession[] => {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'colors'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors'>('editor');
   
   // Selection & Navigation
   const [activeAssetId, setActiveAssetId] = useState<string | null>(null); // Can be LayerID or GroupID
@@ -779,6 +781,12 @@ function App() {
             icon={<Palette size={22} strokeWidth={1.5} />}
             label="Colors"
           />
+          <NavButton
+            active={activeTab === 'resize'}
+            onClick={() => setActiveTab('resize')}
+            icon={<Minimize2 size={22} strokeWidth={1.5} />}
+            label="Resize"
+          />
         </nav>
 
         <div className="mt-auto flex flex-col gap-4 items-center">
@@ -875,6 +883,8 @@ function App() {
                  onUpdateSession={handleUpdateSmartStitchSession}
                />
              ) : null
+           ) : activeTab === 'resize' ? (
+             <ResizeView />
            ) : (
              <ColorExplorerView />
            )}
@@ -928,7 +938,7 @@ function App() {
 
 // --- Helper Components ---
 
-type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'colors';
+type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors';
 
 interface LibraryPanelProps {
     isSelectionMode: boolean;
