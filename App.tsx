@@ -145,7 +145,17 @@ function App() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem(SMART_STITCH_STORAGE_KEY, JSON.stringify(smartStitchSessions));
+    // Persist session metadata only — image dataUrls are too large for localStorage
+    // and would trip QuotaExceededError on first upload.
+    const persistable = smartStitchSessions.map((session) => ({
+      ...session,
+      images: [],
+    }));
+    try {
+      window.localStorage.setItem(SMART_STITCH_STORAGE_KEY, JSON.stringify(persistable));
+    } catch (error) {
+      console.warn('Smart Stitch session persistence skipped', error);
+    }
   }, [smartStitchSessions]);
 
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
