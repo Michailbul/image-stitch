@@ -6,7 +6,7 @@ import ColorExplorerView from './views/ColorExplorerView';
 import CameraLanguageView from './views/CameraLanguageView';
 import ResizeView from './views/ResizeView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
-import { ImageLayer, StitchItem, AssetGroup, CropRegion, SmartStitchSession, SmartStitchSettings } from './types';
+import { ImageLayer, StitchItem, AssetGroup, CropRegion } from './types';
 import {
   Plus,
   BoxSelect,
@@ -42,59 +42,6 @@ import {
   Camera as CameraIcon
 } from 'lucide-react';
 
-const SMART_STITCH_STORAGE_KEY = 'laniameda.smart-stitch.sessions.v1';
-
-const DEFAULT_SMART_STITCH_SETTINGS: SmartStitchSettings = {
-  containerWidth: 1200,
-  targetRowHeight: 300,
-  spacing: 12,
-  backgroundColor: '#ffffff',
-  exportScale: 1,
-};
-
-const createSmartStitchSession = (index: number): SmartStitchSession => {
-  const timestamp = new Date().toISOString();
-  return {
-    id: crypto.randomUUID(),
-    name: `Stitch ${index}`,
-    images: [],
-    settings: { ...DEFAULT_SMART_STITCH_SETTINGS },
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-};
-
-const hydrateSmartStitchSessions = (): SmartStitchSession[] => {
-  if (typeof window === 'undefined') {
-    return [createSmartStitchSession(1)];
-  }
-
-  try {
-    const raw = window.localStorage.getItem(SMART_STITCH_STORAGE_KEY);
-    if (!raw) return [createSmartStitchSession(1)];
-
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      return [createSmartStitchSession(1)];
-    }
-
-    return parsed.map((session: Partial<SmartStitchSession>, index) => ({
-      id: session.id ?? crypto.randomUUID(),
-      name: session.name ?? `Stitch ${index + 1}`,
-      images: Array.isArray(session.images) ? session.images : [],
-      settings: {
-        ...DEFAULT_SMART_STITCH_SETTINGS,
-        ...(session.settings ?? {}),
-      },
-      createdAt: session.createdAt ?? new Date().toISOString(),
-      updatedAt: session.updatedAt ?? session.createdAt ?? new Date().toISOString(),
-    }));
-  } catch (error) {
-    console.error('Failed to restore Smart Stitch sessions', error);
-    return [createSmartStitchSession(1)];
-  }
-};
-
 function App() {
   const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors' | 'camera'>('editor');
   
@@ -118,14 +65,10 @@ function App() {
   const [layers, setLayers] = useState<ImageLayer[]>([]);
   const [groups, setGroups] = useState<AssetGroup[]>([]);
   const [stitchItems, setStitchItems] = useState<StitchItem[]>([]);
-  const [smartStitchSessions, setSmartStitchSessions] = useState<SmartStitchSession[]>(() => hydrateSmartStitchSessions());
-  const [activeSmartStitchSessionId, setActiveSmartStitchSessionId] = useState<string | null>(null);
 
   // Derived State
   const activeLayer = layers.find(l => l.id === activeAssetId);
   const activeGroup = groups.find(g => g.id === activeAssetId);
-  const activeSmartStitchSession =
-    smartStitchSessions.find((session) => session.id === activeSmartStitchSessionId) ?? smartStitchSessions[0] ?? null;
 
   // --- Theme Toggle ---
   useEffect(() => {
@@ -135,28 +78,6 @@ function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [isDarkMode]);
-
-  useEffect(() => {
-    if (smartStitchSessions.length === 0) return;
-    if (!activeSmartStitchSessionId || !smartStitchSessions.some((session) => session.id === activeSmartStitchSessionId)) {
-      setActiveSmartStitchSessionId(smartStitchSessions[0].id);
-    }
-  }, [smartStitchSessions, activeSmartStitchSessionId]);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    // Persist session metadata only — image dataUrls are too large for localStorage
-    // and would trip QuotaExceededError on first upload.
-    const persistable = smartStitchSessions.map((session) => ({
-      ...session,
-      images: [],
-    }));
-    try {
-      window.localStorage.setItem(SMART_STITCH_STORAGE_KEY, JSON.stringify(persistable));
-    } catch (error) {
-      console.warn('Smart Stitch session persistence skipped', error);
-    }
-  }, [smartStitchSessions]);
 
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
 
@@ -500,42 +421,6 @@ function App() {
         const newItem: StitchItem = { id: crypto.randomUUID(), layerId, cropId };
         setStitchItems(prev => [...prev, newItem]);
     }
-  };
-
-  const handleCreateSmartStitchSession = () => {
-    const nextSession = createSmartStitchSession(smartStitchSessions.length + 1);
-    setSmartStitchSessions((prev) => [nextSession, ...prev]);
-    setActiveSmartStitchSessionId(nextSession.id);
-    setActiveTab('smartStitch');
-  };
-
-  const handleUpdateSmartStitchSession = (nextSession: SmartStitchSession) => {
-    setSmartStitchSessions((prev) =>
-      prev.map((session) =>
-        session.id === nextSession.id
-          ? {
-              ...nextSession,
-              updatedAt: nextSession.updatedAt ?? new Date().toISOString(),
-            }
-          : session
-      )
-    );
-  };
-
-  const handleDeleteSmartStitchSession = (sessionId: string) => {
-    setSmartStitchSessions((prev) => {
-      if (prev.length === 1) {
-        const freshSession = createSmartStitchSession(1);
-        setActiveSmartStitchSessionId(freshSession.id);
-        return [freshSession];
-      }
-
-      const nextSessions = prev.filter((session) => session.id !== sessionId);
-      if (activeSmartStitchSessionId === sessionId) {
-        setActiveSmartStitchSessionId(nextSessions[0]?.id ?? null);
-      }
-      return nextSessions;
-    });
   };
 
   // --- Filtered Library List ---
@@ -898,12 +783,7 @@ function App() {
            ) : activeTab === 'stitch' ? (
              <StitchView layers={layers} groups={groups} stitchItems={stitchItems} setStitchItems={setStitchItems} />
            ) : activeTab === 'smartStitch' ? (
-             activeSmartStitchSession ? (
-               <SmartStitchView
-                 session={activeSmartStitchSession}
-                 onUpdateSession={handleUpdateSmartStitchSession}
-               />
-             ) : null
+             <SmartStitchView />
            ) : activeTab === 'resize' ? (
              <ResizeView />
            ) : activeTab === 'camera' ? (
@@ -915,17 +795,8 @@ function App() {
       </main>
 
       {/* --- RIGHT PANEL (LIBRARY) — hidden on self-contained views --- */}
-      {(activeTab === 'editor' || activeTab === 'stitch' || activeTab === 'smartStitch') && (
+      {(activeTab === 'editor' || activeTab === 'stitch') && (
       <aside className="w-80 bg-background border-l border-border flex flex-col z-20 shadow-sharp transition-colors duration-300">
-        {activeTab === 'smartStitch' ? (
-          <SmartStitchExplorer
-            sessions={smartStitchSessions}
-            activeSessionId={activeSmartStitchSession?.id ?? null}
-            onSelectSession={setActiveSmartStitchSessionId}
-            onCreateSession={handleCreateSmartStitchSession}
-            onDeleteSession={handleDeleteSmartStitchSession}
-          />
-        ) : (
           <LibraryPanel
             isSelectionMode={isSelectionMode}
             selectedLibraryIds={selectedLibraryIds}
@@ -951,7 +822,6 @@ function App() {
             setActiveMenuGroupId={setActiveMenuGroupId}
             handleDeleteItem={handleDeleteItem}
           />
-        )}
       </aside>
       )}
 
@@ -1190,147 +1060,6 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
       </div>
     </>
 );
-
-interface SmartStitchExplorerProps {
-    sessions: SmartStitchSession[];
-    activeSessionId: string | null;
-    onSelectSession: (sessionId: string) => void;
-    onCreateSession: () => void;
-    onDeleteSession: (sessionId: string) => void;
-}
-
-const SmartStitchExplorer: React.FC<SmartStitchExplorerProps> = ({
-    sessions,
-    activeSessionId,
-    onSelectSession,
-    onCreateSession,
-    onDeleteSession,
-}) => {
-    const activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0] ?? null;
-
-    const formatTimestamp = (timestamp: string) => {
-        const parsed = new Date(timestamp);
-        if (Number.isNaN(parsed.getTime())) return 'Saved recently';
-        return parsed.toLocaleString([], {
-            month: 'short',
-            day: 'numeric',
-            hour: 'numeric',
-            minute: '2-digit',
-        });
-    };
-
-    return (
-        <>
-          <div className="h-20 flex items-center justify-between px-6 border-b border-border bg-background/50 backdrop-blur-sm">
-             <div>
-                 <span className="font-mono text-[10px] text-accent tracking-widest uppercase block mb-1">STITCH FILES</span>
-                 <span className="font-serif text-lg text-primary flex items-center gap-2 transition-colors duration-300">
-                     Saved Stitches <span className="font-sans text-xs text-secondary font-normal">({sessions.length})</span>
-                 </span>
-             </div>
-             <button
-                onClick={onCreateSession}
-                className="h-10 px-3 bg-inverse text-inverseText hover:bg-accent hover:text-white transition-colors shadow-lg rounded-full flex items-center gap-2 text-xs font-medium"
-                title="Start New Stitch"
-             >
-                <CopyPlus size={16} />
-                Start New
-             </button>
-          </div>
-
-          <div className="flex-1 overflow-y-auto">
-             <div className="p-4 border-b border-border bg-surface/40">
-                 <span className="font-mono text-[10px] uppercase tracking-widest text-secondary">Session Explorer</span>
-             </div>
-
-             <div className="divide-y divide-border/50">
-                {sessions.map((session) => {
-                    const isActive = session.id === activeSessionId;
-                    const preview = session.images[0]?.dataUrl ?? null;
-                    return (
-                        <button
-                            key={session.id}
-                            onClick={() => onSelectSession(session.id)}
-                            className={`w-full text-left p-4 transition-colors ${isActive ? 'bg-accentDim/40' : 'hover:bg-surface'}`}
-                        >
-                            <div className="flex items-start gap-3">
-                                <div className="w-14 h-14 rounded-lg overflow-hidden border border-border bg-surface flex-shrink-0">
-                                    {preview ? (
-                                        <img src={preview} alt="" className="w-full h-full object-cover" />
-                                    ) : (
-                                        <div className="w-full h-full flex items-center justify-center text-secondary">
-                                            <ImageIcon size={16} />
-                                        </div>
-                                    )}
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex items-center justify-between gap-2">
-                                        <h4 className={`text-sm truncate ${isActive ? 'text-accent font-medium' : 'text-primary'}`}>
-                                            {session.name}
-                                        </h4>
-                                        {sessions.length > 1 && (
-                                            <span
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    onDeleteSession(session.id);
-                                                }}
-                                                className="p-1 rounded hover:bg-red-500/10 hover:text-red-500 text-secondary"
-                                            >
-                                                <Trash2 size={14} />
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className="mt-1 flex items-center gap-2 text-[10px] font-mono uppercase tracking-wider text-secondary">
-                                        <span>{session.images.length} images</span>
-                                        <span className="w-1 h-1 rounded-full bg-border"></span>
-                                        <span>{formatTimestamp(session.updatedAt)}</span>
-                                    </div>
-                                    <div className="mt-2 flex items-center gap-2 text-[10px] text-secondary">
-                                        <span className="rounded-sm border border-border px-1.5 py-0.5">
-                                            {session.settings.containerWidth}px
-                                        </span>
-                                        <span className="rounded-sm border border-border px-1.5 py-0.5">
-                                            {Math.round(session.settings.exportScale * 100)}%
-                                        </span>
-                                    </div>
-                                </div>
-                            </div>
-                        </button>
-                    );
-                })}
-             </div>
-
-             <div className="p-4 border-t border-border bg-surface/20">
-                <div className="flex items-center gap-2 mb-3">
-                    <ImageIcon size={14} className="text-accent" />
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-accent">Current Files</span>
-                </div>
-                {activeSession && activeSession.images.length > 0 ? (
-                    <div className="space-y-2">
-                        {activeSession.images.map((image) => (
-                            <div key={image.id} className="flex items-center gap-3 rounded-xl border border-border bg-background px-3 py-2">
-                                <div className="w-10 h-10 rounded-md overflow-hidden border border-border bg-surface flex-shrink-0">
-                                    <img src={image.dataUrl} alt="" className="w-full h-full object-cover" />
-                                </div>
-                                <div className="min-w-0">
-                                    <div className="text-xs text-primary truncate">{image.name}</div>
-                                    <div className="text-[10px] font-mono uppercase tracking-wider text-secondary">
-                                        {image.width}×{image.height}
-                                    </div>
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                ) : (
-                    <div className="rounded-2xl border border-dashed border-border p-5 text-center text-xs text-secondary">
-                        Start a new stitch, add images, then switch back here any time.
-                    </div>
-                )}
-             </div>
-          </div>
-        </>
-    );
-};
 
 const GroupStitchView: React.FC<{ 
     group: AssetGroup, 

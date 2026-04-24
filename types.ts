@@ -66,6 +66,46 @@ export interface SmartStitchLayoutItem {
   height: number;
 }
 
+// --- Auto-Stitch: persistent threads + canvas ---
+
+export interface StoredImage {
+  id: string;
+  threadId: string;
+  name: string;
+  dataUrl: string;
+  width: number;
+  height: number;
+  createdAt: number;
+}
+
+export interface CanvasItem {
+  id: string;
+  type?: 'image' | 'stitch'; // undefined = 'image' (legacy)
+  imageId?: string;          // for 'image'
+  dataUrl?: string;          // for 'stitch' (inline result)
+  stitchMode?: 'auto' | 'manual';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface StitchSettings {
+  containerWidth: number;
+  targetRowHeight: number;
+  spacing: number;
+  backgroundColor: string;
+}
+
+export interface Thread {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  canvasItems: CanvasItem[];
+  settings: StitchSettings;
+}
+
 // --- Camera Language Library ---
 
 export type CameraMoveCategory =
