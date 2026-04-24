@@ -2,11 +2,11 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Upload, Download, Trash2, Settings2, Plus, X, Edit2, MoreVertical,
   Layers, Sparkles, Hand, CheckSquare, Square, MousePointer2, Keyboard,
-  ZoomIn, ZoomOut, Maximize2, Check, Eye, LayoutGrid,
+  ZoomIn, ZoomOut, Maximize2, Check, Eye, LayoutGrid, Crop,
 } from 'lucide-react';
 import { Thread, StoredImage, CanvasItem, StitchSettings, SmartStitchImage } from '../types';
 import {
-  generateSmartStitch, generateManualStitch, loadImage, computeJustifiedLayout,
+  generateSmartStitch, generateManualStitch, loadImage, computeJustifiedLayout, cropImage,
 } from '../utils/imageUtils';
 import {
   listThreads, saveThread, deleteThread, createThread,
@@ -39,6 +39,9 @@ export default function SmartStitchView() {
   const [isSpaceDown, setIsSpaceDown] = useState(false);
   const [previewImage, setPreviewImage] = useState<StoredImage | null>(null);
   const [librarySelection, setLibrarySelection] = useState<Set<string>>(new Set());
+  // Crop-in-place: rect stored as item-local fractions (0..1) so it survives resizes.
+  const [cropState, setCropState] = useState<{ itemId: string; rect: { x: number; y: number; width: number; height: number } } | null>(null);
+  const [isCropping, setIsCropping] = useState(false);
   const historyRef = useRef<{ canvasItems: CanvasItem[]; images: StoredImage[] }[]>([]);
   const canvasItemsRef = useRef(canvasItems);
   const imagesRef = useRef(images);
@@ -328,6 +331,70 @@ export default function SmartStitchView() {
     }
   };
 
+  // --- Crop in place ---
+  const enterCropMode = () => {
+    if (selectedIds.size !== 1 || autoPreview) return;
+    const id = [...selectedIds][0];
+    const item = canvasItems.find((i) => i.id === id);
+    if (!item) return;
+    // Start with full-item crop, inset slightly so handles are visible.
+    setCropState({ itemId: id, rect: { x: 0.05, y: 0.05, width: 0.9, height: 0.9 } });
+  };
+
+  const cancelCrop = () => setCropState(null);
+
+  const applyCrop = async () => {
+    if (!cropState || !activeThreadId) return;
+    const item = canvasItems.find((i) => i.id === cropState.itemId);
+    if (!item) { setCropState(null); return; }
+    const src = item.type === 'stitch' ? item.dataUrl : imageMap.get(item.imageId || '')?.dataUrl;
+    if (!src) { setCropState(null); return; }
+    setIsCropping(true);
+    try {
+      const loaded = await loadImage(src);
+      const percentCrop = {
+        id: 'crop', isLocked: false, replacementSrc: null, isStitched: false,
+        x: cropState.rect.x * 100,
+        y: cropState.rect.y * 100,
+        width: cropState.rect.width * 100,
+        height: cropState.rect.height * 100,
+      };
+      const croppedUrl = await cropImage(src, percentCrop, loaded.width, loaded.height);
+      const croppedImg = await loadImage(croppedUrl);
+
+      pushHistory();
+      const worldX = item.x + cropState.rect.x * item.width;
+      const worldY = item.y + cropState.rect.y * item.height;
+      const worldW = cropState.rect.width * item.width;
+      const worldH = cropState.rect.height * item.height;
+
+      if (item.type === 'stitch') {
+        setCanvasItems((prev) => prev.map((i) =>
+          i.id === item.id ? { ...i, dataUrl: croppedUrl, x: worldX, y: worldY, width: worldW, height: worldH } : i
+        ));
+      } else {
+        const srcImg = imageMap.get(item.imageId || '');
+        const newStored: StoredImage = {
+          id: crypto.randomUUID(),
+          threadId: activeThreadId,
+          name: srcImg ? `${srcImg.name} (crop)` : 'crop.png',
+          dataUrl: croppedUrl,
+          width: croppedImg.width,
+          height: croppedImg.height,
+          createdAt: Date.now(),
+        };
+        await addImage(newStored);
+        setImages((prev) => [...prev, newStored]);
+        setCanvasItems((prev) => prev.map((i) =>
+          i.id === item.id ? { ...i, imageId: newStored.id, x: worldX, y: worldY, width: worldW, height: worldH } : i
+        ));
+      }
+      setCropState(null);
+    } finally {
+      setIsCropping(false);
+    }
+  };
+
   // --- Hotkeys ---
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -337,16 +404,21 @@ export default function SmartStitchView() {
 
       if (e.key === 'Escape') {
         if (previewImage) setPreviewImage(null);
+        else if (cropState) cancelCrop();
         else if (autoPreview) cancelAutoPreview();
         else setSelectedIds(new Set());
         return;
       }
       if (mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
         e.preventDefault();
-        if (!autoPreview) undo();
+        if (!autoPreview && !cropState) undo();
         return;
       }
       if (autoPreview && e.key === 'Enter') { e.preventDefault(); approveAutoPreview(); return; }
+      if (cropState && e.key === 'Enter') { e.preventDefault(); applyCrop(); return; }
+      if (!cropState && !autoPreview && (e.key === 'c' || e.key === 'C') && !mod && selectedIds.size === 1) {
+        e.preventDefault(); enterCropMode(); return;
+      }
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0) {
         e.preventDefault();
@@ -388,7 +460,7 @@ export default function SmartStitchView() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage]);
+  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage, cropState]);
 
   // --- Zoom helpers ---
   const zoomBy = (factor: number) => {
@@ -612,7 +684,7 @@ export default function SmartStitchView() {
     // Marquee — only if target is viewport or world itself (not an item)
     if (!onSurface) return;
     if (e.button !== 0) return;
-    if (autoPreview) return; // no selection change during preview
+    if (autoPreview || cropState) return; // no selection change during preview/crop
 
     const start = toWorld(e.clientX, e.clientY);
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
@@ -644,6 +716,7 @@ export default function SmartStitchView() {
   const handleItemPointerDown = (e: React.PointerEvent, item: CanvasItem) => {
     if (spaceRef.current || e.button === 1) return; // let viewport handle pan
     if (autoPreview) { e.stopPropagation(); return; } // lock during preview
+    if (cropState) { e.stopPropagation(); return; } // lock during crop
     e.stopPropagation();
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
 
@@ -683,7 +756,7 @@ export default function SmartStitchView() {
 
   // --- Resize ---
   const handleResizePointerDown = (e: React.PointerEvent, item: CanvasItem, corner: 'tl' | 'tr' | 'bl' | 'br') => {
-    if (autoPreview) { e.stopPropagation(); return; }
+    if (autoPreview || cropState) { e.stopPropagation(); return; }
     e.stopPropagation();
     setSelectedIds(new Set([item.id]));
     const startX = e.clientX, startY = e.clientY;
@@ -937,7 +1010,23 @@ export default function SmartStitchView() {
             </div>
 
             <div className="flex items-center gap-2 pointer-events-auto">
-              {autoPreview ? (
+              {cropState ? (
+                <>
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-accent bg-accentDim px-3 py-1.5 rounded-full">
+                    Cropping — drag handles, Enter to apply, Esc to cancel
+                  </span>
+                  <button onClick={cancelCrop}
+                    className="bg-background border border-border hover:border-secondary text-secondary hover:text-primary px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors"
+                    title="Esc">
+                    <X size={12} /> Cancel
+                  </button>
+                  <button onClick={applyCrop} disabled={isCropping}
+                    className="bg-accent text-white hover:bg-orange-600 px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 shadow-sharp transition-colors disabled:opacity-40"
+                    title="Enter">
+                    <Check size={14} /> {isCropping ? 'Cropping…' : 'Apply Crop'}
+                  </button>
+                </>
+              ) : autoPreview ? (
                 <>
                   <span className="font-mono text-[10px] uppercase tracking-widest text-accent bg-accentDim px-3 py-1.5 rounded-full">
                     Previewing Auto Layout — tweak parameters →
@@ -955,6 +1044,11 @@ export default function SmartStitchView() {
                 </>
               ) : (
                 <>
+                  <button onClick={enterCropMode} disabled={selectedIds.size !== 1}
+                    className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    title="Crop selected item in place (C)">
+                    <Crop size={13} /> Crop
+                  </button>
                   <button onClick={enterAutoPreview} disabled={selectedIds.size === 0}
                     className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Auto-arrange selected into justified rows (preview)">
@@ -1057,13 +1151,21 @@ export default function SmartStitchView() {
                         </button>
                       </div>
                     )}
-                    {isSelected && !autoPreview && (
+                    {isSelected && !autoPreview && !cropState && (
                       <>
                         <ResizeHandle corner="tl" onPointerDown={(e) => handleResizePointerDown(e, item, 'tl')} />
                         <ResizeHandle corner="tr" onPointerDown={(e) => handleResizePointerDown(e, item, 'tr')} />
                         <ResizeHandle corner="bl" onPointerDown={(e) => handleResizePointerDown(e, item, 'bl')} />
                         <ResizeHandle corner="br" onPointerDown={(e) => handleResizePointerDown(e, item, 'br')} />
                       </>
+                    )}
+                    {cropState && cropState.itemId === item.id && (
+                      <CropOverlay
+                        item={item}
+                        rect={cropState.rect}
+                        zoom={zoom}
+                        onChange={(rect) => setCropState((s) => (s ? { ...s, rect } : s))}
+                      />
                     )}
                   </div>
                 );
@@ -1198,6 +1300,8 @@ export default function SmartStitchView() {
               <HotkeyRow keys={['Drag empty']} label="Marquee select" />
               <HotkeyRow keys={['←', '→', '↑', '↓']} label="Nudge 1px (Shift: 10px)" />
               <HotkeyRow keys={['Shift', '+ Drag corner']} label="Free resize" />
+              <HotkeyRow keys={['C']} label="Crop selected item" />
+              <HotkeyRow keys={['Enter']} label="Apply crop" />
             </div>
           </div>
         </div>
@@ -1216,6 +1320,109 @@ const ResizeHandle: React.FC<{ corner: 'tl' | 'tr' | 'bl' | 'br'; onPointerDown:
   };
   return <div onPointerDown={onPointerDown} className={`absolute w-3 h-3 bg-background border-2 border-accent rounded-sm z-30 ${pos[corner]}`} />;
 };
+
+type CropRect = { x: number; y: number; width: number; height: number };
+type CropHandle = 'tl' | 'tr' | 'bl' | 'br' | 't' | 'r' | 'b' | 'l' | 'move';
+
+const CropOverlay: React.FC<{
+  item: CanvasItem;
+  rect: CropRect;
+  zoom: number;
+  onChange: (rect: CropRect) => void;
+}> = ({ item, rect, zoom, onChange }) => {
+  const rectRef = useRef(rect);
+  useEffect(() => { rectRef.current = rect; }, [rect]);
+
+  const startDrag = (handle: CropHandle) => (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const startX = e.clientX, startY = e.clientY;
+    const orig = { ...rectRef.current };
+    const onMove = (ev: PointerEvent) => {
+      // px → item-local fraction
+      const dx = (ev.clientX - startX) / zoom / item.width;
+      const dy = (ev.clientY - startY) / zoom / item.height;
+      let { x, y, width, height } = orig;
+      if (handle === 'move') {
+        x = clamp01(orig.x + dx, 0, 1 - orig.width);
+        y = clamp01(orig.y + dy, 0, 1 - orig.height);
+      } else {
+        if (handle.includes('l')) { x = clamp01(orig.x + dx, 0, orig.x + orig.width - 0.02); width = orig.width - (x - orig.x); }
+        if (handle.includes('r')) { width = clamp01(orig.width + dx, 0.02, 1 - orig.x); }
+        if (handle.includes('t')) { y = clamp01(orig.y + dy, 0, orig.y + orig.height - 0.02); height = orig.height - (y - orig.y); }
+        if (handle.includes('b')) { height = clamp01(orig.height + dy, 0.02, 1 - orig.y); }
+      }
+      onChange({ x, y, width, height });
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const pct = (v: number) => `${v * 100}%`;
+  const handleSize = 10 / zoom;
+  const edgeThick = 6 / zoom;
+  const border = 2 / zoom;
+
+  return (
+    <div className="absolute inset-0 z-20" style={{ pointerEvents: 'none' }}>
+      {/* Dim mask — 4 rects around the crop window */}
+      <div className="absolute bg-black/60" style={{ left: 0, top: 0, right: 0, height: pct(rect.y) }} />
+      <div className="absolute bg-black/60" style={{ left: 0, top: pct(rect.y + rect.height), right: 0, bottom: 0 }} />
+      <div className="absolute bg-black/60" style={{ left: 0, top: pct(rect.y), width: pct(rect.x), height: pct(rect.height) }} />
+      <div className="absolute bg-black/60" style={{ left: pct(rect.x + rect.width), top: pct(rect.y), right: 0, height: pct(rect.height) }} />
+
+      {/* Crop window */}
+      <div
+        className="absolute"
+        style={{
+          left: pct(rect.x), top: pct(rect.y),
+          width: pct(rect.width), height: pct(rect.height),
+          boxShadow: `0 0 0 ${border}px var(--color-accent, #F26157)`,
+          pointerEvents: 'auto',
+          cursor: 'move',
+        }}
+        onPointerDown={startDrag('move')}
+      >
+        {/* Rule-of-thirds guide */}
+        <div className="absolute inset-0 pointer-events-none" style={{
+          backgroundImage: `linear-gradient(to right, transparent 33.33%, rgba(255,255,255,0.3) 33.33%, rgba(255,255,255,0.3) 33.66%, transparent 33.66%, transparent 66.66%, rgba(255,255,255,0.3) 66.66%, rgba(255,255,255,0.3) 66.99%, transparent 66.99%), linear-gradient(to bottom, transparent 33.33%, rgba(255,255,255,0.3) 33.33%, rgba(255,255,255,0.3) 33.66%, transparent 33.66%, transparent 66.66%, rgba(255,255,255,0.3) 66.66%, rgba(255,255,255,0.3) 66.99%, transparent 66.99%)`,
+        }} />
+
+        {/* Edge handles */}
+        <div onPointerDown={startDrag('t')} className="absolute left-0 right-0 bg-transparent" style={{ top: -edgeThick / 2, height: edgeThick, cursor: 'ns-resize' }} />
+        <div onPointerDown={startDrag('b')} className="absolute left-0 right-0 bg-transparent" style={{ bottom: -edgeThick / 2, height: edgeThick, cursor: 'ns-resize' }} />
+        <div onPointerDown={startDrag('l')} className="absolute top-0 bottom-0 bg-transparent" style={{ left: -edgeThick / 2, width: edgeThick, cursor: 'ew-resize' }} />
+        <div onPointerDown={startDrag('r')} className="absolute top-0 bottom-0 bg-transparent" style={{ right: -edgeThick / 2, width: edgeThick, cursor: 'ew-resize' }} />
+
+        {/* Corner handles */}
+        {(['tl', 'tr', 'bl', 'br'] as const).map((c) => {
+          const pos: Record<string, React.CSSProperties> = {
+            tl: { top: -handleSize / 2, left: -handleSize / 2, cursor: 'nwse-resize' },
+            tr: { top: -handleSize / 2, right: -handleSize / 2, cursor: 'nesw-resize' },
+            bl: { bottom: -handleSize / 2, left: -handleSize / 2, cursor: 'nesw-resize' },
+            br: { bottom: -handleSize / 2, right: -handleSize / 2, cursor: 'nwse-resize' },
+          };
+          return (
+            <div
+              key={c}
+              onPointerDown={startDrag(c)}
+              className="absolute bg-background border-2 border-accent rounded-sm"
+              style={{ width: handleSize, height: handleSize, ...pos[c] }}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+function clamp01(v: number, min = 0, max = 1): number {
+  return Math.max(min, Math.min(max, v));
+}
 
 const RangeField: React.FC<{ label: string; value: number; unit: string; min: number; max: number; step: number; onChange: (v: number) => void }> = ({ label, value, unit, min, max, step, onChange }) => (
   <label className="flex flex-col gap-2">
