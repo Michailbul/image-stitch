@@ -3,6 +3,7 @@ import ImageCropper from './components/ImageCropper';
 import StitchView from './views/StitchView';
 import SmartStitchView from './views/SmartStitchView';
 import ColorExplorerView from './views/ColorExplorerView';
+import CameraLanguageView from './views/CameraLanguageView';
 import ResizeView from './views/ResizeView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
 import { ImageLayer, StitchItem, AssetGroup, CropRegion, SmartStitchSession, SmartStitchSettings } from './types';
@@ -37,7 +38,8 @@ import {
   Image as ImageIcon,
   FileImage,
   CopyPlus,
-  Minimize2
+  Minimize2,
+  Camera as CameraIcon
 } from 'lucide-react';
 
 const SMART_STITCH_STORAGE_KEY = 'laniameda.smart-stitch.sessions.v1';
@@ -94,7 +96,7 @@ const hydrateSmartStitchSessions = (): SmartStitchSession[] => {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors' | 'camera'>('editor');
   
   // Selection & Navigation
   const [activeAssetId, setActiveAssetId] = useState<string | null>(null); // Can be LayerID or GroupID
@@ -192,20 +194,23 @@ function App() {
   };
 
   // --- Drag & Drop (Global File Upload) ---
-  const handleDragOver = (e: React.DragEvent) => { 
-      e.preventDefault(); 
-      // Only show overlay if actual files are being dragged (avoids internal drag conflicts)
+  // Only active on editor/stitch tabs; self-contained views (smartStitch, colors) handle their own drops.
+  const isGlobalDropActive = activeTab === 'editor' || activeTab === 'stitch';
+  const handleDragOver = (e: React.DragEvent) => {
+      e.preventDefault();
+      if (!isGlobalDropActive) return;
       if (e.dataTransfer.types.includes('Files')) {
-         setIsDraggingFile(true); 
+         setIsDraggingFile(true);
       }
   };
-  const handleDragLeave = (e: React.DragEvent) => { 
-      e.preventDefault(); 
-      setIsDraggingFile(false); 
+  const handleDragLeave = (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDraggingFile(false);
   };
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDraggingFile(false);
+    if (!isGlobalDropActive) return;
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       Array.from(e.dataTransfer.files).forEach((file) => processFile(file as File));
     }
@@ -773,13 +778,19 @@ function App() {
             active={activeTab === 'smartStitch'}
             onClick={() => setActiveTab('smartStitch')}
             icon={<Layers size={22} strokeWidth={1.5} />}
-            label="Smart Stitch"
+            label="Auto Stitch"
           />
           <NavButton
             active={activeTab === 'colors'}
             onClick={() => setActiveTab('colors')}
             icon={<Palette size={22} strokeWidth={1.5} />}
             label="Colors"
+          />
+          <NavButton
+            active={activeTab === 'camera'}
+            onClick={() => setActiveTab('camera')}
+            icon={<CameraIcon size={22} strokeWidth={1.5} />}
+            label="Camera"
           />
           <NavButton
             active={activeTab === 'resize'}
@@ -885,6 +896,8 @@ function App() {
              ) : null
            ) : activeTab === 'resize' ? (
              <ResizeView />
+           ) : activeTab === 'camera' ? (
+             <CameraLanguageView />
            ) : (
              <ColorExplorerView />
            )}
@@ -938,7 +951,7 @@ function App() {
 
 // --- Helper Components ---
 
-type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors';
+type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors' | 'camera';
 
 interface LibraryPanelProps {
     isSelectionMode: boolean;

@@ -65,3 +65,29 @@ export interface SmartStitchLayoutItem {
   width: number;
   height: number;
 }
+
+// --- Camera Language Library ---
+
+export type CameraMoveCategory =
+  | 'push_pull'
+  | 'orbit'
+  | 'vertical'
+  | 'lateral'
+  | 'lens_focus'
+  | 'creative';
+
+export interface CameraMove {
+  id: string;
+  name: string;
+  aliases?: string[];
+  category: CameraMoveCategory;
+  intentTags: string[];
+  definition: string;
+  emotionalEffect: string;
+  bestFor: string[];
+  copyPrompt: string;
+  modelNotes?: string;
+  risk?: string;
+  previewVideoUrl?: string;
+  previewPoster?: string;
+}

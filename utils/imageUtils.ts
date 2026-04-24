@@ -316,6 +316,86 @@ export const generateSmartStitch = async (
 };
 
 /**
+ * Computes justified-row layout positions for a set of items with intrinsic aspect ratios.
+ * Returns positions with (0,0) at the top-left (includes spacing as padding).
+ */
+export const computeJustifiedLayout = (
+  items: { id: string; width: number; height: number }[],
+  settings: { containerWidth: number; targetRowHeight: number; spacing: number }
+): { id: string; x: number; y: number; width: number; height: number }[] => {
+  if (items.length === 0) return [];
+  const { containerWidth, targetRowHeight, spacing } = settings;
+
+  const rows: { id: string; aspectRatio: number; scaledWidth: number }[][] = [];
+  let row: { id: string; aspectRatio: number; scaledWidth: number }[] = [];
+  let currentWidth = 0;
+  for (const item of items) {
+    const aspectRatio = item.width / item.height;
+    const scaledWidth = targetRowHeight * aspectRatio;
+    row.push({ id: item.id, aspectRatio, scaledWidth });
+    currentWidth += scaledWidth;
+    const total = currentWidth + (row.length - 1) * spacing;
+    if (total >= containerWidth) {
+      rows.push(row);
+      row = [];
+      currentWidth = 0;
+    }
+  }
+  if (row.length > 0) rows.push(row);
+
+  const result: { id: string; x: number; y: number; width: number; height: number }[] = [];
+  let y = spacing;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const isLast = i === rows.length - 1;
+    const ar = r.reduce((s, it) => s + it.aspectRatio, 0);
+    const avail = containerWidth - spacing * 2 - (r.length - 1) * spacing;
+    const rowH = (isLast && r.length > 0 && ar < (avail / targetRowHeight) * 0.6)
+      ? targetRowHeight : avail / ar;
+    let x = spacing;
+    for (const it of r) {
+      const w = rowH * it.aspectRatio;
+      result.push({ id: it.id, x, y, width: w, height: rowH });
+      x += w + spacing;
+    }
+    y += rowH + spacing;
+  }
+  return result;
+};
+
+/**
+ * Manual stitch: respects each item's exact canvas position and size.
+ * Output bitmap = bounding box of all items. Items drawn at (item.x - minX, item.y - minY).
+ */
+export const generateManualStitch = async (
+  items: { dataUrl: string; x: number; y: number; width: number; height: number }[],
+  backgroundColor: string
+): Promise<string> => {
+  if (items.length === 0) return '';
+  const minX = Math.min(...items.map(i => i.x));
+  const minY = Math.min(...items.map(i => i.y));
+  const maxX = Math.max(...items.map(i => i.x + i.width));
+  const maxY = Math.max(...items.map(i => i.y + i.height));
+  const width = Math.max(1, Math.ceil(maxX - minX));
+  const height = Math.max(1, Math.ceil(maxY - minY));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Could not get canvas context');
+
+  ctx.fillStyle = backgroundColor;
+  ctx.fillRect(0, 0, width, height);
+
+  for (const item of items) {
+    const img = await loadImage(item.dataUrl);
+    ctx.drawImage(img, item.x - minX, item.y - minY, item.width, item.height);
+  }
+  return canvas.toDataURL('image/png');
+};
+
+/**
  * Automatically stitches images horizontally.
  * Scales all images to the height of the tallest image to ensure perfect alignment.
  */
