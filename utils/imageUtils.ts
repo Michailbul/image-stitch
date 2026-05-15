@@ -426,3 +426,108 @@ export const generateStitchedCanvas = async (
 
   return canvas.toDataURL('image/png');
 };
+
+export type StitchLayout = 'row' | 'column' | 'grid';
+
+export interface LayoutStitchOptions {
+  layout: StitchLayout;
+  columns?: number;
+  spacing?: number;
+  backgroundColor?: string; // 'transparent' skips the fill
+  exportScale?: number;
+}
+
+/**
+ * Reassembles a set of images into a row, column, or grid composition.
+ * Row matches a common height, column a common width, grid uses uniform
+ * cells (object-contain) sized to the largest panel.
+ */
+export const generateLayoutStitch = async (
+  sources: string[],
+  options: LayoutStitchOptions
+): Promise<string> => {
+  if (sources.length === 0) return '';
+
+  const { layout, spacing = 0 } = options;
+  const backgroundColor = options.backgroundColor ?? '#ffffff';
+  const exportScale = clampExportScale(options.exportScale);
+  const imgs = await Promise.all(sources.map((src) => loadImage(src)));
+
+  const canvas = document.createElement('canvas');
+
+  const setup = (logicalWidth: number, logicalHeight: number): CanvasRenderingContext2D => {
+    canvas.width = Math.max(1, Math.ceil(logicalWidth * exportScale));
+    canvas.height = Math.max(1, Math.ceil(logicalHeight * exportScale));
+    const context = prepareCanvasContext(canvas);
+    context.scale(exportScale, exportScale);
+    if (backgroundColor !== 'transparent') {
+      context.fillStyle = backgroundColor;
+      context.fillRect(0, 0, logicalWidth, logicalHeight);
+    }
+    return context;
+  };
+
+  if (layout === 'row') {
+    const rowHeight = Math.max(...imgs.map((img) => img.height));
+    const placed = imgs.map((img) => ({
+      img,
+      width: img.width * (rowHeight / img.height),
+      height: rowHeight,
+    }));
+    const totalWidth =
+      placed.reduce((sum, p) => sum + p.width, 0) + spacing * (placed.length + 1);
+    const ctx = setup(totalWidth, rowHeight + spacing * 2);
+    let x = spacing;
+    for (const p of placed) {
+      ctx.drawImage(p.img, x, spacing, p.width, p.height);
+      x += p.width + spacing;
+    }
+    return canvas.toDataURL('image/png');
+  }
+
+  if (layout === 'column') {
+    const colWidth = Math.max(...imgs.map((img) => img.width));
+    const placed = imgs.map((img) => ({
+      img,
+      width: colWidth,
+      height: img.height * (colWidth / img.width),
+    }));
+    const totalHeight =
+      placed.reduce((sum, p) => sum + p.height, 0) + spacing * (placed.length + 1);
+    const ctx = setup(colWidth + spacing * 2, totalHeight);
+    let y = spacing;
+    for (const p of placed) {
+      ctx.drawImage(p.img, spacing, y, p.width, p.height);
+      y += p.height + spacing;
+    }
+    return canvas.toDataURL('image/png');
+  }
+
+  // grid
+  const columns = Math.max(1, options.columns ?? 3);
+  const rows = Math.ceil(imgs.length / columns);
+  const cellWidth = Math.max(...imgs.map((img) => img.width));
+  const cellHeight = Math.max(...imgs.map((img) => img.height));
+  const totalWidth = columns * cellWidth + spacing * (columns + 1);
+  const totalHeight = rows * cellHeight + spacing * (rows + 1);
+  const ctx = setup(totalWidth, totalHeight);
+
+  imgs.forEach((img, index) => {
+    const col = index % columns;
+    const row = Math.floor(index / columns);
+    const cellX = spacing + col * (cellWidth + spacing);
+    const cellY = spacing + row * (cellHeight + spacing);
+    const fit = Math.min(cellWidth / img.width, cellHeight / img.height);
+    const drawWidth = img.width * fit;
+    const drawHeight = img.height * fit;
+    ctx.drawImage(
+      img,
+      cellX + (cellWidth - drawWidth) / 2,
+      cellY + (cellHeight - drawHeight) / 2,
+      drawWidth,
+      drawHeight
+    );
+  });
+
+  return canvas.toDataURL('image/png');
+};

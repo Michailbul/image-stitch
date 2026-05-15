@@ -5,6 +5,7 @@ import SmartStitchView from './views/SmartStitchView';
 import ColorExplorerView from './views/ColorExplorerView';
 import CameraLanguageView from './views/CameraLanguageView';
 import ResizeView from './views/ResizeView';
+import StoryboardView from './views/StoryboardView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
 import { ImageLayer, StitchItem, AssetGroup, CropRegion } from './types';
 import {
@@ -39,11 +40,12 @@ import {
   FileImage,
   CopyPlus,
   Minimize2,
-  Camera as CameraIcon
+  Camera as CameraIcon,
+  Clapperboard
 } from 'lucide-react';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors' | 'camera'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'storyboard' | 'resize' | 'colors' | 'camera'>('editor');
   
   // Selection & Navigation
   const [activeAssetId, setActiveAssetId] = useState<string | null>(null); // Can be LayerID or GroupID
@@ -676,6 +678,12 @@ function App() {
             label="Auto Stitch"
           />
           <NavButton
+            active={activeTab === 'storyboard'}
+            onClick={() => setActiveTab('storyboard')}
+            icon={<Clapperboard size={22} strokeWidth={1.5} />}
+            label="Storyboard"
+          />
+          <NavButton
             active={activeTab === 'colors'}
             onClick={() => setActiveTab('colors')}
             icon={<Palette size={22} strokeWidth={1.5} />}
@@ -784,6 +792,8 @@ function App() {
              <StitchView layers={layers} groups={groups} stitchItems={stitchItems} setStitchItems={setStitchItems} />
            ) : activeTab === 'smartStitch' ? (
              <SmartStitchView />
+           ) : activeTab === 'storyboard' ? (
+             <StoryboardView />
            ) : activeTab === 'resize' ? (
              <ResizeView />
            ) : activeTab === 'camera' ? (
@@ -831,7 +841,7 @@ function App() {
 
 // --- Helper Components ---
 
-type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'resize' | 'colors' | 'camera';
+type MainTab = 'editor' | 'stitch' | 'smartStitch' | 'storyboard' | 'resize' | 'colors' | 'camera';
 
 interface LibraryPanelProps {
     isSelectionMode: boolean;
