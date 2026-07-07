@@ -2,21 +2,32 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Upload, Download, Trash2, Settings2, Plus, X, Edit2, MoreVertical,
   Layers, Sparkles, Hand, CheckSquare, Square, MousePointer2, Keyboard,
-  ZoomIn, ZoomOut, Maximize2, Check, Eye, LayoutGrid, Crop,
+  ZoomIn, ZoomOut, Maximize2, Check, Eye, LayoutGrid, Crop, Frame as FrameIcon,
 } from 'lucide-react';
-import { Thread, StoredImage, CanvasItem, StitchSettings, SmartStitchImage } from '../types';
+import { Thread, StoredImage, CanvasItem, StitchSettings, SmartStitchImage, FrameSpec } from '../types';
 import {
   generateSmartStitch, generateManualStitch, loadImage, computeJustifiedLayout, cropImage,
+  generateFrameStitch, computeFrameExportScale,
 } from '../utils/imageUtils';
 import {
   listThreads, saveThread, deleteThread, createThread,
   listImagesByThread, addImage, deleteImage, DEFAULT_SETTINGS,
 } from '../utils/imageStore';
 
-const THUMB_HEIGHT = 180;
 const MIN_ITEM_SIZE = 30;
-const MIN_ZOOM = 0.1;
+const MIN_ZOOM = 0.02;
 const MAX_ZOOM = 5;
+// Canvas world units are output pixels: images land at native size and the
+// frame's world size is exactly its export resolution.
+const DEFAULT_FRAME_RESOLUTION = 2560;
+
+const bboxOf = (rects: { x: number; y: number; width: number; height: number }[]) => {
+  const minX = Math.min(...rects.map(r => r.x));
+  const minY = Math.min(...rects.map(r => r.y));
+  const maxX = Math.max(...rects.map(r => r.x + r.width));
+  const maxY = Math.max(...rects.map(r => r.y + r.height));
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+};
 
 type Snapshot = Map<string, { x: number; y: number; width: number; height: number }>;
 
@@ -42,6 +53,9 @@ export default function SmartStitchView() {
   // Crop-in-place: rect stored as item-local fractions (0..1) so it survives resizes.
   const [cropState, setCropState] = useState<{ itemId: string; rect: { x: number; y: number; width: number; height: number } } | null>(null);
   const [isCropping, setIsCropping] = useState(false);
+  // Fixed-aspect export frame (persisted per thread)
+  const [frame, setFrame] = useState<FrameSpec | null>(null);
+  const [isFrameStitching, setIsFrameStitching] = useState(false);
   const historyRef = useRef<{ canvasItems: CanvasItem[]; images: StoredImage[] }[]>([]);
   const canvasItemsRef = useRef(canvasItems);
   const imagesRef = useRef(images);
@@ -126,6 +140,7 @@ export default function SmartStitchView() {
     if (!thread) return;
     setCanvasItems(thread.canvasItems);
     setSettings(thread.settings);
+    setFrame(thread.frame ?? null);
     setSelectedIds(new Set());
     setAutoPreview(null);
     setZoom(1);
@@ -143,14 +158,14 @@ export default function SmartStitchView() {
     if (!activeThreadId || autoPreview) return; // don't persist preview state
     const thread = threads.find(t => t.id === activeThreadId);
     if (!thread) return;
-    if (thread.canvasItems === canvasItems && thread.settings === settings) return;
+    if (thread.canvasItems === canvasItems && thread.settings === settings && (thread.frame ?? null) === frame) return;
     const id = setTimeout(() => {
-      const updated: Thread = { ...thread, canvasItems, settings, updatedAt: Date.now() };
+      const updated: Thread = { ...thread, canvasItems, settings, frame, updatedAt: Date.now() };
       saveThread(updated);
       setThreads(prev => prev.map(t => t.id === updated.id ? updated : t));
     }, 500);
     return () => clearTimeout(id);
-  }, [canvasItems, settings, activeThreadId, threads, autoPreview]);
+  }, [canvasItems, settings, frame, activeThreadId, threads, autoPreview]);
 
   // --- Close thread menu on outside click ---
   useEffect(() => {
@@ -245,29 +260,60 @@ export default function SmartStitchView() {
   const runManualStitchOnIds = async (ids: string[]): Promise<CanvasItem | null> => {
     const target = canvasItems.filter(i => ids.includes(i.id));
     if (target.length === 0) return null;
-    const payload: { dataUrl: string; x: number; y: number; width: number; height: number }[] = [];
+
+    // Collect each item's source plus its native pixel dims. On-canvas sizes
+    // are display sizes (often far smaller than the source), so stitching at
+    // those sizes would bake in a permanent downscale.
+    const entries: { dataUrl: string; x: number; y: number; width: number; height: number; nativeWidth: number; nativeHeight: number }[] = [];
     for (const ci of target) {
       const dataUrl = resolveDataUrl(ci);
       if (!dataUrl) continue;
-      payload.push({ dataUrl, x: ci.x, y: ci.y, width: ci.width, height: ci.height });
+      let nativeWidth = ci.width;
+      let nativeHeight = ci.height;
+      if (ci.type === 'image') {
+        const img = images.find(i => i.id === ci.imageId);
+        if (img?.width) { nativeWidth = img.width; nativeHeight = img.height; }
+      } else if (ci.nativeWidth && ci.nativeHeight) {
+        nativeWidth = ci.nativeWidth;
+        nativeHeight = ci.nativeHeight;
+      } else {
+        const loaded = await loadImage(dataUrl);
+        nativeWidth = loaded.width;
+        nativeHeight = loaded.height;
+      }
+      entries.push({ dataUrl, x: ci.x, y: ci.y, width: ci.width, height: ci.height, nativeWidth, nativeHeight });
     }
+    if (entries.length === 0) return null;
+
+    // Uniformly scale the whole composition so the most-downscaled image is
+    // drawn at (at least) its native resolution — preserves layout, no quality loss.
+    // Items render cover-fit, so the binding axis per item is min(W/w, H/h).
+    const qualityScale = Math.max(1, ...entries.map(e => Math.min(e.nativeWidth / e.width, e.nativeHeight / e.height)));
+    const payload = entries.map(e => ({
+      dataUrl: e.dataUrl,
+      x: e.x * qualityScale,
+      y: e.y * qualityScale,
+      width: e.width * qualityScale,
+      height: e.height * qualityScale,
+    }));
+
     const url = await generateManualStitch(payload, settings.backgroundColor);
     if (!url) return null;
     const stitchedImg = await loadImage(url);
     const minX = Math.min(...target.map(i => i.x));
     const maxY = Math.max(...target.map(i => i.y + i.height));
-    const aspect = stitchedImg.width / stitchedImg.height;
-    const displayWidth = Math.min(400, stitchedImg.width);
-    const displayHeight = displayWidth / aspect;
     return {
       id: crypto.randomUUID(),
       type: 'stitch',
       dataUrl: url,
       stitchMode: autoPreview ? 'auto' : 'manual',
+      nativeWidth: stitchedImg.width,
+      nativeHeight: stitchedImg.height,
       x: minX,
       y: maxY + 30,
-      width: displayWidth,
-      height: displayHeight,
+      // native pixel size — world units are output pixels
+      width: stitchedImg.width,
+      height: stitchedImg.height,
     };
   };
 
@@ -395,6 +441,170 @@ export default function SmartStitchView() {
     }
   };
 
+  // --- Export frame (fixed-aspect stitch) ---
+  const frameRect = useMemo(() => {
+    if (!frame) return null;
+    return { x: frame.x, y: frame.y, width: frame.width, height: (frame.width * frame.aspectH) / frame.aspectW };
+  }, [frame]);
+
+  // Items intersecting the frame, in canvas order (= z-order)
+  const frameItems = useMemo(() => {
+    if (!frameRect) return [] as CanvasItem[];
+    return canvasItems.filter(i =>
+      i.x < frameRect.x + frameRect.width && i.x + i.width > frameRect.x &&
+      i.y < frameRect.y + frameRect.height && i.y + i.height > frameRect.y
+    );
+  }, [canvasItems, frameRect]);
+
+  const nativeDimsOf = (ci: CanvasItem): { width: number; height: number } => {
+    if (ci.type !== 'stitch') {
+      const img = images.find(i => i.id === ci.imageId);
+      if (img) return { width: img.width, height: img.height };
+    }
+    if (ci.nativeWidth && ci.nativeHeight) return { width: ci.nativeWidth, height: ci.nativeHeight };
+    return { width: ci.width, height: ci.height };
+  };
+
+  // Live output size for the current frame + resolution mode
+  const frameExport = useMemo(() => {
+    if (!frame || !frameRect) return null;
+    const exportItems = frameItems.map(ci => {
+      const native = nativeDimsOf(ci);
+      return { x: ci.x, y: ci.y, width: ci.width, height: ci.height, nativeWidth: native.width, nativeHeight: native.height };
+    });
+    const scale = computeFrameExportScale(exportItems, frameRect, frame.resolution);
+    const autoScale = computeFrameExportScale(exportItems, frameRect, 'auto');
+    return {
+      width: Math.max(1, Math.round(frameRect.width * scale)),
+      height: Math.max(1, Math.round(frameRect.height * scale)),
+      belowMax: frame.resolution !== 'auto' && scale < autoScale - 1e-9,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frame, frameRect, frameItems, images]);
+
+  // Frame world size == output pixels. Width for a given aspect + long-edge target:
+  const frameWidthFor = (aspectW: number, aspectH: number, longEdge: number) =>
+    aspectW >= aspectH ? longEdge : (longEdge * aspectW) / aspectH;
+
+  const toggleFrame = () => {
+    if (frame) { setFrame(null); return; }
+    if (!viewportRef.current) return;
+    const r = viewportRef.current.getBoundingClientRect();
+    const center = toWorld(r.left + r.width / 2, r.top + r.height / 2);
+    const width = frameWidthFor(16, 9, DEFAULT_FRAME_RESOLUTION);
+    const height = (width * 9) / 16;
+    const next: FrameSpec = {
+      x: center.x - width / 2, y: center.y - height / 2, width,
+      aspectW: 16, aspectH: 9, resolution: DEFAULT_FRAME_RESOLUTION,
+    };
+    setFrame(next);
+    zoomToFit({ x: next.x, y: next.y, width, height });
+  };
+
+  const setFrameAspect = (aspectW: number, aspectH: number) => {
+    if (!frame) return;
+    const oldH = (frame.width * frame.aspectH) / frame.aspectW;
+    const cx = frame.x + frame.width / 2;
+    const cy = frame.y + oldH / 2;
+    // Pin the long edge to the pixel target; free-sized frames keep their width.
+    const width = typeof frame.resolution === 'number'
+      ? frameWidthFor(aspectW, aspectH, frame.resolution)
+      : frame.width;
+    const height = (width * aspectH) / aspectW;
+    const next: FrameSpec = { ...frame, aspectW, aspectH, width, x: cx - width / 2, y: cy - height / 2 };
+    setFrame(next);
+    zoomToFit({ x: next.x, y: next.y, width, height });
+  };
+
+  const setFrameResolution = (resolution: 'auto' | number) => {
+    if (!frame) return;
+    if (resolution === 'auto') { setFrame({ ...frame, resolution }); return; }
+    // Resize the frame on canvas to the real pixel size — images keep their
+    // native footprint, so you see exactly how much canvas they cover.
+    const oldH = (frame.width * frame.aspectH) / frame.aspectW;
+    const cx = frame.x + frame.width / 2;
+    const cy = frame.y + oldH / 2;
+    const width = frameWidthFor(frame.aspectW, frame.aspectH, resolution);
+    const height = (width * frame.aspectH) / frame.aspectW;
+    const next: FrameSpec = { ...frame, resolution, width, x: cx - width / 2, y: cy - height / 2 };
+    setFrame(next);
+    zoomToFit({ x: next.x, y: next.y, width, height });
+  };
+
+  const handleFramePointerDown = (e: React.PointerEvent, mode: 'move' | 'resize') => {
+    e.stopPropagation();
+    if (autoPreview || cropState || !frame) return;
+    e.preventDefault();
+    const startX = e.clientX, startY = e.clientY;
+    const startZoom = zoomRef.current;
+    const orig = { ...frame };
+    const onMove = (ev: PointerEvent) => {
+      const dx = (ev.clientX - startX) / startZoom;
+      const dy = (ev.clientY - startY) / startZoom;
+      if (mode === 'move') {
+        setFrame(f => (f ? { ...f, x: orig.x + dx, y: orig.y + dy } : f));
+      } else {
+        setFrame(f => (f ? { ...f, width: Math.max(120, orig.width + dx) } : f));
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const handleFrameStitch = async () => {
+    if (!frame || !frameRect || frameItems.length === 0 || isFrameStitching) return;
+    setIsFrameStitching(true);
+    try {
+      const entries: { dataUrl: string; x: number; y: number; width: number; height: number; nativeWidth: number; nativeHeight: number }[] = [];
+      for (const ci of frameItems) {
+        const dataUrl = resolveDataUrl(ci);
+        if (!dataUrl) continue;
+        let { width: nativeWidth, height: nativeHeight } = nativeDimsOf(ci);
+        if (ci.type === 'stitch' && !(ci.nativeWidth && ci.nativeHeight)) {
+          // legacy stitch items persisted without native dims
+          const loaded = await loadImage(dataUrl);
+          nativeWidth = loaded.width;
+          nativeHeight = loaded.height;
+        }
+        entries.push({ dataUrl, x: ci.x, y: ci.y, width: ci.width, height: ci.height, nativeWidth, nativeHeight });
+      }
+      if (entries.length === 0) return;
+
+      const bg = frame.transparent ? 'transparent' : settings.backgroundColor;
+      const result = await generateFrameStitch(entries, frameRect, bg, { resolution: frame.resolution });
+
+      // Download immediately — the frame is the deliverable.
+      const a = document.createElement('a');
+      a.href = result.dataUrl;
+      const threadName = threads.find(t => t.id === activeThreadId)?.name || 'stitch';
+      a.download = `${threadName.toLowerCase().replace(/\s+/g, '-')}-${frame.aspectW}-${frame.aspectH}-${result.width}x${result.height}.png`;
+      a.click();
+
+      // Also drop the result on the canvas at native pixel size so it can be reused.
+      pushHistory();
+      const newItem: CanvasItem = {
+        id: crypto.randomUUID(),
+        type: 'stitch',
+        dataUrl: result.dataUrl,
+        stitchMode: 'manual',
+        nativeWidth: result.width,
+        nativeHeight: result.height,
+        x: frameRect.x,
+        y: frameRect.y + frameRect.height + Math.max(40, frameRect.height * 0.05),
+        width: result.width,
+        height: result.height,
+      };
+      setCanvasItems(prev => [...prev, newItem]);
+      setSelectedIds(new Set([newItem.id]));
+    } finally {
+      setIsFrameStitching(false);
+    }
+  };
+
   // --- Hotkeys ---
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -418,6 +628,20 @@ export default function SmartStitchView() {
       if (cropState && e.key === 'Enter') { e.preventDefault(); applyCrop(); return; }
       if (!cropState && !autoPreview && (e.key === 'c' || e.key === 'C') && !mod && selectedIds.size === 1) {
         e.preventDefault(); enterCropMode(); return;
+      }
+      if (!cropState && !autoPreview && (e.key === 'f' || e.key === 'F') && !mod) {
+        e.preventDefault(); toggleFrame(); return;
+      }
+      if ((e.key === ']' || e.key === '[') && !mod && selectedIds.size > 0) {
+        e.preventDefault();
+        pushHistory();
+        const toFront = e.key === ']';
+        setCanvasItems(prev => {
+          const sel = prev.filter(i => selectedIds.has(i.id));
+          const rest = prev.filter(i => !selectedIds.has(i.id));
+          return toFront ? [...rest, ...sel] : [...sel, ...rest];
+        });
+        return;
       }
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0) {
@@ -460,7 +684,7 @@ export default function SmartStitchView() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage, cropState]);
+  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage, cropState, frame]);
 
   // --- Zoom helpers ---
   const zoomBy = (factor: number) => {
@@ -477,6 +701,32 @@ export default function SmartStitchView() {
   };
 
   const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  // --- Fit view to a world rect ---
+  const zoomToFit = (rect: { x: number; y: number; width: number; height: number }, factor = 0.8) => {
+    const el = viewportRef.current;
+    if (!el || rect.width <= 0 || rect.height <= 0) return;
+    const r = el.getBoundingClientRect();
+    const z = clamp(Math.min(r.width / rect.width, r.height / rect.height) * factor, MIN_ZOOM, MAX_ZOOM);
+    setZoom(z);
+    setPan({
+      x: r.width / 2 - (rect.x + rect.width / 2) * z,
+      y: r.height / 2 - (rect.y + rect.height / 2) * z,
+    });
+  };
+
+  const fitIfOutOfView = (rect: { x: number; y: number; width: number; height: number }) => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const z = zoomRef.current, p = panRef.current;
+    const view = { x: -p.x / z, y: -p.y / z, width: r.width / z, height: r.height / z };
+    const contained =
+      rect.x >= view.x && rect.y >= view.y &&
+      rect.x + rect.width <= view.x + view.width &&
+      rect.y + rect.height <= view.y + view.height;
+    if (!contained) zoomToFit(rect);
+  };
 
   // --- Thread actions ---
   const handleNewThread = async () => {
@@ -544,17 +794,15 @@ export default function SmartStitchView() {
       const loaded = await Promise.all(files.map(readFileAsStoredImage(activeThreadId)));
       await Promise.all(loaded.map(addImage));
       setImages(prev => [...prev, ...loaded]);
-      const newItems: CanvasItem[] = loaded.map((img, i) => {
-        const aspect = img.width / img.height;
-        const h = THUMB_HEIGHT, w = h * aspect;
-        return {
-          id: crypto.randomUUID(), type: 'image', imageId: img.id,
-          x: drop.x - w / 2 + i * 16, y: drop.y - h / 2 + i * 16,
-          width: w, height: h,
-        };
-      });
+      // Native pixel size: world units are output pixels.
+      const newItems: CanvasItem[] = loaded.map((img, i) => ({
+        id: crypto.randomUUID(), type: 'image', imageId: img.id,
+        x: drop.x - img.width / 2 + i * 48, y: drop.y - img.height / 2 + i * 48,
+        width: img.width, height: img.height,
+      }));
       setCanvasItems(prev => [...prev, ...newItems]);
       setSelectedIds(new Set(newItems.map(i => i.id)));
+      fitIfOutOfView(bboxOf(newItems));
       return;
     }
     if (!draggedLibraryImage) return;
@@ -649,15 +897,14 @@ export default function SmartStitchView() {
 
   const addCanvasItemFromImage = (img: StoredImage, cx: number, cy: number) => {
     pushHistory();
-    const aspect = img.width / img.height;
-    const height = THUMB_HEIGHT;
-    const width = height * aspect;
+    // Native pixel size: world units are output pixels.
     const item: CanvasItem = {
       id: crypto.randomUUID(), type: 'image', imageId: img.id,
-      x: cx - width / 2, y: cy - height / 2, width, height,
+      x: cx - img.width / 2, y: cy - img.height / 2, width: img.width, height: img.height,
     };
     setCanvasItems(prev => [...prev, item]);
     setSelectedIds(new Set([item.id]));
+    fitIfOutOfView(item);
   };
 
   // --- Viewport pointer down: pan (space/middle) or marquee (on empty) ---
@@ -1044,6 +1291,15 @@ export default function SmartStitchView() {
                 </>
               ) : (
                 <>
+                  <button onClick={toggleFrame}
+                    className={`border px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors ${
+                      frame
+                        ? 'bg-accentDim border-accent text-accent'
+                        : 'bg-background border-border hover:border-accent text-secondary hover:text-accent'
+                    }`}
+                    title="Toggle export frame (F)">
+                    <FrameIcon size={13} /> Frame
+                  </button>
                   <button onClick={enterCropMode} disabled={selectedIds.size !== 1}
                     className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Crop selected item in place (C)">
@@ -1075,7 +1331,13 @@ export default function SmartStitchView() {
             <button onClick={() => zoomBy(1.2)} className="w-7 h-7 rounded-full flex items-center justify-center text-secondary hover:text-primary hover:bg-surface" title={`${modMeta}++`}>
               <ZoomIn size={13} />
             </button>
-            <button onClick={resetView} className="w-7 h-7 rounded-full flex items-center justify-center text-secondary hover:text-primary hover:bg-surface" title="Reset view">
+            <button
+              onClick={() => {
+                if (frameRect) zoomToFit(frameRect);
+                else if (canvasItems.length > 0) zoomToFit(bboxOf(canvasItems));
+                else resetView();
+              }}
+              className="w-7 h-7 rounded-full flex items-center justify-center text-secondary hover:text-primary hover:bg-surface" title="Fit frame / content">
               <Maximize2 size={12} />
             </button>
           </div>
@@ -1171,6 +1433,74 @@ export default function SmartStitchView() {
                 );
               })}
 
+              {/* Export frame */}
+              {frame && frameRect && (
+                <div
+                  className="absolute z-20"
+                  style={{
+                    left: frameRect.x, top: frameRect.y,
+                    width: frameRect.width, height: frameRect.height,
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {/* Dim everything outside the frame */}
+                  <div
+                    className="absolute inset-0 pointer-events-none"
+                    style={{ boxShadow: '0 0 0 100000px rgba(10, 8, 5, 0.35)' }}
+                  />
+                  {/* Frame border */}
+                  <div
+                    className="absolute inset-0 pointer-events-none"
+                    style={{ boxShadow: `inset 0 0 0 ${2 / zoom}px var(--color-accent, #F26157)` }}
+                  />
+
+                  {/* Label — drag to move */}
+                  <div
+                    className="absolute left-0 bottom-full flex items-center gap-1.5 cursor-move select-none"
+                    style={{ transform: `scale(${1 / zoom})`, transformOrigin: 'left bottom', paddingBottom: 8, pointerEvents: 'auto' }}
+                    onPointerDown={(e) => handleFramePointerDown(e, 'move')}
+                  >
+                    <span className="bg-accent text-white text-[9px] font-mono uppercase tracking-widest px-2 py-1 rounded-full shadow-sm flex items-center gap-1 whitespace-nowrap">
+                      <FrameIcon size={10} /> {frame.aspectW}:{frame.aspectH}
+                    </span>
+                    {frameExport && (
+                      <span className="bg-inverse text-inverseText text-[9px] font-mono px-2 py-1 rounded-full shadow-sm whitespace-nowrap">
+                        {frameExport.width}×{frameExport.height}px
+                      </span>
+                    )}
+                    <span className="bg-background border border-border text-secondary text-[9px] font-mono px-2 py-1 rounded-full shadow-sm whitespace-nowrap">
+                      {frameItems.length} in frame
+                    </span>
+                  </div>
+
+                  {/* Edge strips — drag to move */}
+                  {(['t', 'b', 'l', 'r'] as const).map((edge) => {
+                    const thick = 8 / zoom;
+                    const s: React.CSSProperties =
+                      edge === 't' ? { left: 0, right: 0, top: -thick / 2, height: thick }
+                      : edge === 'b' ? { left: 0, right: 0, bottom: -thick / 2, height: thick }
+                      : edge === 'l' ? { top: 0, bottom: 0, left: -thick / 2, width: thick }
+                      : { top: 0, bottom: 0, right: -thick / 2, width: thick };
+                    return (
+                      <div key={edge} className="absolute cursor-move"
+                        style={{ ...s, pointerEvents: 'auto' }}
+                        onPointerDown={(e) => handleFramePointerDown(e, 'move')} />
+                    );
+                  })}
+
+                  {/* Corner handle — drag to resize (aspect locked) */}
+                  <div
+                    className="absolute bg-background border-2 border-accent rounded-sm"
+                    style={{
+                      width: 14 / zoom, height: 14 / zoom,
+                      right: -7 / zoom, bottom: -7 / zoom,
+                      cursor: 'nwse-resize', pointerEvents: 'auto',
+                    }}
+                    onPointerDown={(e) => handleFramePointerDown(e, 'resize')}
+                  />
+                </div>
+              )}
+
               {/* Marquee */}
               {marquee && (
                 <div
@@ -1231,6 +1561,106 @@ export default function SmartStitchView() {
               <button onClick={approveAutoPreview} disabled={isStitching}
                 className="flex-1 py-2.5 rounded-lg bg-accent text-white hover:bg-orange-600 transition-colors text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-40">
                 <Check size={13} /> Approve
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Frame panel — fixed-aspect export */}
+        {frame && !autoPreview && (
+          <div className="w-[280px] flex-shrink-0 border-l border-border bg-background flex flex-col animate-fade-in">
+            <div className="p-4 border-b border-border flex items-center justify-between">
+              <span className="font-mono text-[10px] text-accent font-bold tracking-widest uppercase flex items-center gap-2">
+                <FrameIcon size={12} /> Export Frame
+              </span>
+              <button onClick={() => setFrame(null)} className="text-secondary hover:text-primary" title="Remove frame (F)">
+                <X size={14} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-5">
+              <div className="flex flex-col gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-wider text-primary">Aspect Ratio</span>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {([[16, 9], [9, 16], [1, 1], [4, 5], [4, 3], [3, 4], [21, 9], [2, 3]] as const).map(([aw, ah]) => {
+                    const active = frame.aspectW === aw && frame.aspectH === ah;
+                    return (
+                      <button key={`${aw}:${ah}`} onClick={() => setFrameAspect(aw, ah)}
+                        className={`py-2 rounded-lg border text-[10px] font-mono transition-colors ${
+                          active
+                            ? 'border-accent bg-accent text-white'
+                            : 'border-border bg-background text-secondary hover:text-primary hover:border-accent'
+                        }`}>
+                        {aw}:{ah}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-wider text-primary">Resolution</span>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {([
+                    { label: 'Max', value: 'auto' as const, hint: 'Highest quality — sized from the source pixels' },
+                    { label: 'HD', value: 1920, hint: '1920px long edge' },
+                    { label: '2K', value: 2560, hint: '2560px long edge' },
+                    { label: '4K', value: 3840, hint: '3840px long edge' },
+                  ]).map((opt) => {
+                    const active = frame.resolution === opt.value;
+                    return (
+                      <button key={opt.label} title={opt.hint}
+                        onClick={() => setFrameResolution(opt.value)}
+                        className={`py-2 rounded-lg border text-[10px] font-mono transition-colors ${
+                          active
+                            ? 'border-accent bg-accent text-white'
+                            : 'border-border bg-background text-secondary hover:text-primary hover:border-accent'
+                        }`}>
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                {frameExport && (
+                  <div className="font-mono text-[10px] text-secondary flex items-center justify-between">
+                    <span>Output</span>
+                    <span className="text-primary">{frameExport.width} × {frameExport.height}px</span>
+                  </div>
+                )}
+                {frameExport?.belowMax && (
+                  <p className="font-mono text-[9px] uppercase tracking-wider text-accent leading-relaxed">
+                    Below the max detail available from your sources — pick Max to keep every pixel.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-wider text-primary">Background</span>
+                <div className={`flex border border-border rounded-lg overflow-hidden h-9 ${frame.transparent ? 'opacity-40 pointer-events-none' : ''}`}>
+                  <input type="color" value={settings.backgroundColor}
+                    onChange={(e) => setSettings(s => ({ ...s, backgroundColor: e.target.value }))}
+                    className="w-10 h-full cursor-pointer border-r border-border p-0 bg-surface" />
+                  <input type="text" value={settings.backgroundColor}
+                    onChange={(e) => setSettings(s => ({ ...s, backgroundColor: e.target.value }))}
+                    className="flex-1 px-3 font-mono text-xs uppercase bg-background outline-none text-primary" />
+                </div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={!!frame.transparent}
+                    onChange={(e) => setFrame(f => (f ? { ...f, transparent: e.target.checked } : f))}
+                    className="accent-[var(--color-accent,#F26157)]" />
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-secondary">Transparent</span>
+                </label>
+              </div>
+
+              <p className="font-mono text-[9px] uppercase tracking-wider text-secondary leading-relaxed">
+                {frameItems.length === 0
+                  ? 'Drag images into the frame to compose. Anything overlapping the frame gets exported.'
+                  : `${frameItems.length} item${frameItems.length === 1 ? '' : 's'} will be exported, clipped to the frame.`}
+              </p>
+            </div>
+            <div className="p-4 border-t border-border">
+              <button onClick={handleFrameStitch} disabled={frameItems.length === 0 || isFrameStitching}
+                className="w-full py-2.5 rounded-lg bg-accent text-white hover:bg-orange-600 transition-colors text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed">
+                <Download size={13} /> {isFrameStitching ? 'Stitching…' : 'Stitch & Download'}
               </button>
             </div>
           </div>
@@ -1302,6 +1732,8 @@ export default function SmartStitchView() {
               <HotkeyRow keys={['Shift', '+ Drag corner']} label="Free resize" />
               <HotkeyRow keys={['C']} label="Crop selected item" />
               <HotkeyRow keys={['Enter']} label="Apply crop" />
+              <HotkeyRow keys={['F']} label="Toggle export frame" />
+              <HotkeyRow keys={[']', '[']} label="Bring to front / send to back" />
             </div>
           </div>
         </div>

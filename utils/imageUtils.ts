@@ -364,6 +364,30 @@ export const computeJustifiedLayout = (
 };
 
 /**
+ * Draws an image into a destination rect with CSS `object-fit: cover` semantics
+ * (fill the rect preserving the source aspect, clip the overflow). Matches how
+ * canvas items are displayed on screen, so exports never distort.
+ */
+const drawImageCover = (
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  width: number,
+  height: number
+): void => {
+  const scale = Math.max(width / img.width, height / img.height);
+  const dw = img.width * scale;
+  const dh = img.height * scale;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, width, height);
+  ctx.clip();
+  ctx.drawImage(img, x + (width - dw) / 2, y + (height - dh) / 2, dw, dh);
+  ctx.restore();
+};
+
+/**
  * Manual stitch: respects each item's exact canvas position and size.
  * Output bitmap = bounding box of all items. Items drawn at (item.x - minX, item.y - minY).
  */
@@ -382,17 +406,111 @@ export const generateManualStitch = async (
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Could not get canvas context');
+  const ctx = prepareCanvasContext(canvas);
 
-  ctx.fillStyle = backgroundColor;
-  ctx.fillRect(0, 0, width, height);
+  if (backgroundColor !== 'transparent') {
+    ctx.fillStyle = backgroundColor;
+    ctx.fillRect(0, 0, width, height);
+  }
 
   for (const item of items) {
     const img = await loadImage(item.dataUrl);
-    ctx.drawImage(img, item.x - minX, item.y - minY, item.width, item.height);
+    drawImageCover(ctx, img, item.x - minX, item.y - minY, item.width, item.height);
   }
   return canvas.toDataURL('image/png');
+};
+
+// --- Frame stitch (fixed-aspect export) ---
+
+export const MAX_EXPORT_DIMENSION = 8192;
+
+export interface FrameExportItem {
+  x: number;
+  y: number;
+  width: number;   // world units on canvas
+  height: number;
+  nativeWidth: number;  // source pixel dims
+  nativeHeight: number;
+}
+
+/**
+ * Pixels-per-world-unit needed so no source image inside the frame is rendered
+ * below its native resolution. Items display as object-cover, so the binding
+ * axis per item is min(nativeW / w, nativeH / h) — the visible crop's density.
+ *
+ * resolution 'auto' → quality-preserving scale from native pixels.
+ * resolution <n>    → exact long-edge pixel target for the frame.
+ * Result is always capped so neither output edge exceeds maxDimension.
+ */
+export const computeFrameExportScale = (
+  items: FrameExportItem[],
+  frame: { width: number; height: number },
+  resolution: 'auto' | number,
+  maxDimension = MAX_EXPORT_DIMENSION
+): number => {
+  const longEdge = Math.max(frame.width, frame.height);
+  if (longEdge <= 0) return 1;
+
+  let scale: number;
+  if (resolution === 'auto') {
+    scale = Math.max(
+      1,
+      ...items
+        .filter((i) => i.width > 0 && i.height > 0)
+        .map((i) => Math.min(i.nativeWidth / i.width, i.nativeHeight / i.height))
+    );
+  } else {
+    scale = resolution / longEdge;
+  }
+
+  return Math.min(scale, maxDimension / longEdge);
+};
+
+/**
+ * Renders exactly the frame region: each item drawn cover-fit at its canvas
+ * position, scaled so the export meets the requested resolution, clipped to
+ * the frame bounds. Single resample from native pixels — no quality loss.
+ */
+export const generateFrameStitch = async (
+  items: Array<FrameExportItem & { dataUrl: string }>,
+  frame: { x: number; y: number; width: number; height: number },
+  backgroundColor: string,
+  options?: { resolution?: 'auto' | number; maxDimension?: number }
+): Promise<{ dataUrl: string; width: number; height: number }> => {
+  const resolution = options?.resolution ?? 'auto';
+  const scale = computeFrameExportScale(
+    items,
+    frame,
+    resolution,
+    options?.maxDimension ?? MAX_EXPORT_DIMENSION
+  );
+
+  const width = Math.max(1, Math.round(frame.width * scale));
+  const height = Math.max(1, Math.round(frame.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = prepareCanvasContext(canvas);
+
+  if (backgroundColor !== 'transparent') {
+    ctx.fillStyle = backgroundColor;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  for (const item of items) {
+    const img = await loadImage(item.dataUrl);
+    drawImageCover(
+      ctx,
+      img,
+      (item.x - frame.x) * scale,
+      (item.y - frame.y) * scale,
+      item.width * scale,
+      item.height * scale
+    );
+  }
+
+  return { dataUrl: canvas.toDataURL('image/png'), width, height };
 };
 
 /**

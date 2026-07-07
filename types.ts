@@ -84,10 +84,26 @@ export interface CanvasItem {
   imageId?: string;          // for 'image'
   dataUrl?: string;          // for 'stitch' (inline result)
   stitchMode?: 'auto' | 'manual';
+  nativeWidth?: number;      // source pixel dims for 'stitch' items (quality math)
+  nativeHeight?: number;
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+/**
+ * Fixed-aspect export frame on the canvas. Height is derived:
+ * height = width * aspectH / aspectW.
+ */
+export interface FrameSpec {
+  x: number;
+  y: number;
+  width: number;       // world units
+  aspectW: number;
+  aspectH: number;
+  resolution: 'auto' | number; // 'auto' = max quality from native pixels; number = long-edge px
+  transparent?: boolean;
 }
 
 export interface StitchSettings {
@@ -104,6 +120,7 @@ export interface Thread {
   updatedAt: number;
   canvasItems: CanvasItem[];
   settings: StitchSettings;
+  frame?: FrameSpec | null;
 }
 
 // --- Camera Language Library ---
