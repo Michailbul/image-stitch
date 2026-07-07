@@ -44,7 +44,7 @@ import {
   Clapperboard
 } from 'lucide-react';
 
-function App() {
+function App({ embedded = false }: { embedded?: boolean } = {}) {
   const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'storyboard' | 'resize' | 'colors' | 'camera'>('editor');
   
   // Selection & Navigation
@@ -59,7 +59,7 @@ function App() {
   const [dragTargetId, setDragTargetId] = useState<string | null>(null);
   const [activeMenuGroupId, setActiveMenuGroupId] = useState<string | null>(null);
   
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(embedded);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
@@ -73,13 +73,16 @@ function App() {
   const activeGroup = groups.find(g => g.id === activeAssetId);
 
   // --- Theme Toggle ---
+  // When embedded (e.g. in landing page hero), don't manage the documentElement
+  // class — the landing page owns dark mode for the whole page.
   useEffect(() => {
+    if (embedded) return;
     if (isDarkMode) {
       document.documentElement.classList.add('dark');
     } else {
       document.documentElement.classList.remove('dark');
     }
-  }, [isDarkMode]);
+  }, [isDarkMode, embedded]);
 
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
 
@@ -650,7 +653,7 @@ function App() {
   };
 
   return (
-    <div className="flex h-screen bg-background text-primary font-sans overflow-hidden selection:bg-accent selection:text-white transition-colors duration-300">
+    <div className={`flex ${embedded ? 'h-full' : 'h-screen'} bg-background text-primary font-sans overflow-hidden selection:bg-accent selection:text-white transition-colors duration-300`}>
       
       {/* --- SIDEBAR --- */}
       <aside className="w-[72px] flex flex-col items-center py-8 border-r border-border bg-background z-30 transition-colors duration-300">

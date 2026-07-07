@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Layers, Lock, Palette, LayoutGrid, BoxSelect,
-  ArrowRight, Crop, Image, FolderOpen, ExternalLink,
+  ArrowRight, Crop, Image, FolderOpen,
   Check, X, Star, Upload, Download, Scissors, Zap,
   ChevronDown, AlertTriangle, Hexagon, Moon, Settings2, Plus
 } from 'lucide-react';
 import { BackgroundPlus } from '@/components/ui/background-plus';
+import App from './App';
 
 interface LandingPageProps {
   onEnter: () => void;
@@ -20,18 +21,29 @@ function useFadeIn() {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
+    const reveal = () => {
+      el.style.opacity = '1';
+      el.style.transform = 'translateY(0)';
+    };
+    // If already in viewport on mount, reveal immediately.
+    const rect = el.getBoundingClientRect();
+    if (rect.top < window.innerHeight && rect.bottom > 0) {
+      reveal();
+      return;
+    }
     const obs = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {
-          el.style.opacity = '1';
-          el.style.transform = 'translateY(0)';
+          reveal();
           obs.unobserve(el);
         }
       },
-      { threshold: 0.1, rootMargin: '-30px' }
+      { threshold: 0.05, rootMargin: '0px 0px -10% 0px' }
     );
     obs.observe(el);
-    return () => obs.disconnect();
+    // Safety net: force reveal after 1.5s if observer never fired.
+    const t = window.setTimeout(reveal, 1500);
+    return () => { obs.disconnect(); window.clearTimeout(t); };
   }, []);
   return ref;
 }
@@ -417,25 +429,101 @@ function MockupRightPanel({ view }: { view: MockupView }) {
   );
 }
 
+/* ── Live App preview — renders the real <App /> in the hero ── */
+function AppPreview() {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(0.5);
+  const BASE_W = 1280;
+  const BASE_H = 800;
+  const CHROME_H = 32;
+
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const update = (w: number) => {
+      setScale(Math.min(1, Math.max(0.32, w / BASE_W)));
+    };
+    update(el.clientWidth);
+    const observer = new ResizeObserver(entries => {
+      for (const entry of entries) update(entry.contentRect.width);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const visibleH = BASE_H * scale + CHROME_H;
+
+  return (
+    <div
+      ref={wrapperRef}
+      className="relative w-full overflow-hidden border border-[#27272a] bg-[#09090b] transition-all duration-500 hover:border-[#3a3a3a] app-preview-shell"
+      style={{
+        height: visibleH,
+        boxShadow: '0 25px 80px -12px rgba(0,0,0,0.6), 0 0 60px rgba(255,85,46,0.06), inset 0 1px 0 rgba(255,255,255,0.04)',
+      }}
+    >
+      {/* Window chrome — matches app aesthetic */}
+      <div
+        className="absolute top-0 left-0 right-0 flex items-center gap-3 px-3 bg-[#0d0d0f] border-b border-[#27272a] z-20"
+        style={{ height: CHROME_H }}
+      >
+        <div className="flex gap-1.5">
+          <div className="w-2.5 h-2.5 rounded-full bg-[#FF5F56]" />
+          <div className="w-2.5 h-2.5 rounded-full bg-[#FFBD2E]" />
+          <div className="w-2.5 h-2.5 rounded-full bg-[#27C840]" />
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <div className="bg-[#121215] border border-[#27272a] px-3 py-0.5 text-[10px] font-mono text-[#888] flex items-center gap-2">
+            <Hexagon size={9} className="text-[#FF552E]" strokeWidth={2} style={{ fill: 'rgba(255,85,46,0.15)' }} />
+            <span>laniameda.app</span>
+            <div className="w-1 h-1 rounded-full bg-emerald-500" style={{ boxShadow: '0 0 4px #10b981' }} />
+          </div>
+        </div>
+        <span className="font-mono text-[8px] text-[#FF552E] tracking-[0.2em] uppercase">LIVE</span>
+      </div>
+
+      {/* Scaled live App — embedded mode */}
+      <div
+        style={{
+          position: 'absolute',
+          top: CHROME_H,
+          left: 0,
+          width: BASE_W,
+          height: BASE_H,
+          transform: `scale(${scale})`,
+          transformOrigin: 'top left',
+        }}
+      >
+        <App embedded />
+      </div>
+    </div>
+  );
+}
+
 /* ── Full interactive mockup — mirrors real App.tsx chrome ── */
 function AppMockup() {
   const [view, setView] = useState<MockupView>('editor');
   const activeTab = MOCKUP_TABS.find(t => t.id === view)!;
 
   return (
-    <div className="border border-[#262626] bg-[#0a0a0a] overflow-hidden w-full shadow-2xl transition-all duration-500 hover:border-[#333] hover:shadow-[0_25px_60px_-12px_rgba(0,0,0,0.5)]">
-      {/* Browser chrome */}
-      <div className="flex items-center gap-2 px-3 py-2 bg-[#0d0d0d] border-b border-[#262626]">
+    <div className="relative border border-[#27272a] bg-[#09090b] overflow-hidden w-full shadow-2xl transition-all duration-500 hover:border-[#3a3a3a] backdrop-blur-xl" style={{
+      boxShadow: '0 25px 80px -12px rgba(0,0,0,0.6), 0 0 60px rgba(255,85,46,0.06), inset 0 1px 0 rgba(255,255,255,0.04)',
+    }}>
+      {/* Window chrome — minimal, matches app aesthetic */}
+      <div className="flex items-center gap-3 px-3 py-2 bg-[#0d0d0f] border-b border-[#27272a]">
         <div className="flex gap-1.5">
           <div className="w-2.5 h-2.5 rounded-full bg-[#FF5F56]" />
           <div className="w-2.5 h-2.5 rounded-full bg-[#FFBD2E]" />
           <div className="w-2.5 h-2.5 rounded-full bg-[#27C840]" />
         </div>
-        <div className="flex-1 mx-3">
-          <div className="bg-[#1a1a1a] border border-[#2a2a2a] px-3 py-0.5 text-[10px] font-mono text-[#666] max-w-[200px] mx-auto text-center rounded-sm">
-            laniameda.app
+        <div className="flex-1 flex items-center justify-center">
+          <div className="bg-[#121215] border border-[#27272a] px-3 py-0.5 text-[10px] font-mono text-[#888] flex items-center gap-2">
+            <Hexagon size={9} className="text-[#FF552E]" strokeWidth={2} style={{ fill: 'rgba(255,85,46,0.15)' }} />
+            <span>laniameda.app</span>
+            <div className="w-1 h-1 rounded-full bg-emerald-500" style={{ boxShadow: '0 0 4px #10b981' }} />
           </div>
         </div>
+        <span className="font-mono text-[8px] text-[#555] tracking-[0.2em] uppercase">LIVE</span>
       </div>
 
       {/* App layout — matches App.tsx: sidebar + main + right panel */}
@@ -554,7 +642,7 @@ const TOOLS = [
     num: '02',
     icon: Layers,
     label: 'IMAGE STITCHING',
-    color: '#06B6D4',
+    color: '#FF8A6C',
     tagline: 'Reference sheets in seconds, not minutes.',
     pain: {
       headline: 'The Figma tax',
@@ -575,7 +663,7 @@ const TOOLS = [
     num: '03',
     icon: Palette,
     label: 'COLOR EXPLORER',
-    color: '#8B5CF6',
+    color: '#FFB8A3',
     tagline: 'Palette brainstorming without leaving your flow.',
     pain: {
       headline: 'The context-switch tax',
@@ -594,95 +682,34 @@ const TOOLS = [
   },
 ];
 
-/* ── Animated feature carousel for affiliate section ── */
-const PROMPT_FEATURES = [
-  { label: 'Save', desc: 'Send prompts, images, or references to a Telegram bot. It organizes everything automatically.' },
-  { label: 'Browse', desc: 'Search your personal library. Find prompts that worked. Copy them in one click.' },
-  { label: 'Remix', desc: 'Transfer styles between generations. Replace characters across variations. Reuse what works.' },
-  { label: 'Share', desc: 'Keep your library private or share prompts with the creator community. Your rules.' },
-];
-
-function PromptFeatures() {
-  const [active, setActive] = useState(0);
-
-  useEffect(() => {
-    const timer = setInterval(() => setActive(prev => (prev + 1) % PROMPT_FEATURES.length), 4000);
-    return () => clearInterval(timer);
-  }, []);
-
-  return (
-    <div className="max-w-xl mx-auto">
-      <div className="flex border border-[#262626]">
-        {PROMPT_FEATURES.map((f, i) => (
-          <button
-            key={i}
-            onClick={() => setActive(i)}
-            className={`flex-1 relative py-3.5 cursor-pointer overflow-hidden transition-all duration-300 ${
-              i === active ? 'bg-[#0f0f0f]' : 'bg-[#09090b] hover:bg-[#0c0c0e]'
-            }`}
-          >
-            <span className={`relative z-10 font-mono text-[10px] tracking-[0.15em] uppercase transition-all duration-300 ${
-              i === active ? 'text-[#FF552E]' : 'text-[#888] group-hover:text-[#aaa]'
-            }`}>
-              {f.label}
-            </span>
-            {i === active && (
-              <div
-                key={`bar-${active}`}
-                className="absolute bottom-0 left-0 h-[2px] bg-[#FF552E]"
-                style={{ animation: 'fillWidth 4s linear forwards' }}
-              />
-            )}
-          </button>
-        ))}
-      </div>
-      <div className="py-8 text-center min-h-[72px] flex items-center justify-center">
-        <p key={active} className="text-[#a1a1a1] text-sm leading-relaxed max-w-md" style={{ animation: 'fadeIn 0.4s cubic-bezier(0.16,1,0.3,1)' }}>
-          {PROMPT_FEATURES[active].desc}
-        </p>
-      </div>
-    </div>
-  );
-}
-
 /* ── How It Works Section ── */
 function HowItWorksSection() {
   const steps = [
     { num: '01', title: 'Import', desc: 'Drag your AI-generated images into the browser. No uploads, no servers \u2014 everything stays on your machine.', icon: Upload, color: '#FF552E' },
-    { num: '02', title: 'Augment', desc: 'Crop regions, lock edit positions, auto-stitch reference sheets, explore palettes. One workspace for your entire AI pipeline.', icon: Scissors, color: '#F59E0B' },
-    { num: '03', title: 'Export', desc: 'One-click PNG export. Paste directly back into Midjourney, GPT-4o Images, Ideogram, or any AI image model.', icon: Download, color: '#06B6D4' },
+    { num: '02', title: 'Augment', desc: 'Crop regions, lock edit positions, auto-stitch reference sheets, explore palettes. One workspace for your entire AI pipeline.', icon: Scissors, color: '#FF8A6C' },
+    { num: '03', title: 'Export', desc: 'One-click PNG export. Paste directly back into Midjourney, GPT-4o Images, Ideogram, or any AI image model.', icon: Download, color: '#FFB8A3' },
   ];
 
   return (
     <section className="relative py-24 md:py-32 overflow-hidden" style={{ borderBottom: '1px solid #262626' }}>
-      {/* Plus pattern background */}
-      <BackgroundPlus
-        plusColor="#FF552E"
-        plusSize={80}
-        fade={true}
-        className="opacity-[0.03] pointer-events-none"
-      />
+      {/* Grid background — matches app canvas */}
+      <div className="absolute inset-0 pointer-events-none opacity-[0.04]" style={{
+        backgroundSize: '50px 50px',
+        backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.5) 1px, transparent 1px)',
+      }} />
       {/* Decorative gradient orb */}
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] pointer-events-none" style={{
-        background: 'radial-gradient(ellipse, rgba(255,85,46,0.06) 0%, rgba(245,158,11,0.03) 40%, transparent 70%)',
+        background: 'radial-gradient(ellipse, rgba(255,85,46,0.08) 0%, rgba(255,85,46,0.02) 40%, transparent 70%)',
         animation: 'float2 25s ease-in-out infinite',
       }} />
 
       <div className="relative max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
         <FadeSection>
           <div className="text-center mb-16 md:mb-20">
-            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4" style={{
-              background: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>Your AI Workflow, Augmented</p>
+            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4 text-[#FF552E]">Your AI Workflow, Augmented</p>
             <h2 className="font-serif text-3xl md:text-4xl lg:text-5xl" style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}>
               Import. Augment.{' '}
-              <span style={{
-                background: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-              }}>Export back to the model.</span>
+              <span className="text-[#FF552E]">Export back to the model.</span>
             </h2>
           </div>
         </FadeSection>
@@ -694,32 +721,32 @@ function HowItWorksSection() {
               <div key={step.num}>
                 <FadeSection>
                   <div className="relative flex flex-col items-center text-center px-6 md:px-8">
-                    {/* Gradient connector line */}
+                    {/* Connector line */}
                     {i < steps.length - 1 && (
                       <div className="hidden md:block absolute top-10 left-[calc(50%+48px)] w-[calc(100%-96px)] h-px" style={{
-                        background: `linear-gradient(90deg, ${step.color}50, ${steps[i + 1].color}50)`,
+                        background: `linear-gradient(90deg, rgba(255,85,46,0.4), rgba(255,85,46,0.1))`,
                       }}>
-                        <ArrowRight size={12} style={{ color: steps[i + 1].color }} className="absolute -right-1.5 -top-[6px]" />
+                        <ArrowRight size={12} className="text-[#FF552E] absolute -right-1.5 -top-[6px]" />
                       </div>
                     )}
 
+                    {/* Liquid glass icon container */}
                     <div className="relative mb-6">
-                      <div className="w-20 h-20 flex items-center justify-center icon-hover" style={{
-                        background: `linear-gradient(135deg, ${step.color}15, ${step.color}05)`,
-                        border: `1px solid ${step.color}30`,
-                        boxShadow: `0 0 40px ${step.color}12`,
+                      <div className="w-20 h-20 flex items-center justify-center icon-hover backdrop-blur-xl" style={{
+                        background: 'rgba(18,18,21,0.6)',
+                        border: '1px solid rgba(255,85,46,0.25)',
+                        boxShadow: '0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05), 0 0 40px rgba(255,85,46,0.08)',
                       }}>
                         <Icon size={28} strokeWidth={1.5} style={{ color: step.color }} />
                       </div>
-                      <span className="absolute -top-2 -right-3 font-mono text-[10px] text-white px-2 py-0.5 leading-none font-semibold" style={{
-                        background: `linear-gradient(135deg, ${step.color}, ${step.color}CC)`,
-                        boxShadow: `0 0 14px ${step.color}40`,
+                      <span className="absolute -top-2 -right-3 font-mono text-[10px] text-white px-2 py-0.5 leading-none font-semibold bg-[#FF552E]" style={{
+                        boxShadow: '0 4px 12px rgba(255,85,46,0.35)',
                       }}>
                         {step.num}
                       </span>
                     </div>
 
-                    <h3 className="font-serif text-xl mb-3" style={{ letterSpacing: '-0.02em', color: step.color }}>{step.title}</h3>
+                    <h3 className="font-serif text-xl mb-3 text-[#f4f4f5]" style={{ letterSpacing: '-0.02em' }}>{step.title}</h3>
                     <p className="text-sm text-[#a1a1a1] leading-relaxed max-w-[260px]">{step.desc}</p>
                   </div>
                 </FadeSection>
@@ -736,72 +763,64 @@ function HowItWorksSection() {
 function FeaturesSection() {
   return (
     <section id="tools" className="relative py-24 md:py-32 lg:py-40 overflow-hidden">
-      {/* Decorative gradient blobs */}
-      <div className="absolute top-[15%] right-0 w-[500px] h-[500px] pointer-events-none" style={{
-        background: 'radial-gradient(circle, rgba(6,182,212,0.04) 0%, transparent 60%)',
-        animation: 'float1 22s ease-in-out infinite',
+      {/* Grid background — matches app canvas */}
+      <div className="absolute inset-0 pointer-events-none opacity-[0.03]" style={{
+        backgroundSize: '50px 50px',
+        backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.5) 1px, transparent 1px)',
       }} />
-      <div className="absolute bottom-[20%] left-0 w-[400px] h-[400px] pointer-events-none" style={{
-        background: 'radial-gradient(circle, rgba(139,92,246,0.04) 0%, transparent 60%)',
-        animation: 'float3 28s ease-in-out infinite',
+      {/* Single accent orb */}
+      <div className="absolute top-[15%] right-0 w-[500px] h-[500px] pointer-events-none" style={{
+        background: 'radial-gradient(circle, rgba(255,85,46,0.05) 0%, transparent 60%)',
+        animation: 'float1 22s ease-in-out infinite',
+        filter: 'blur(40px)',
       }} />
 
       <div className="relative max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
         <FadeSection>
-          <p className="font-mono text-xs text-[#a1a1a1] tracking-[0.2em] uppercase mb-4">Purpose-Built for AI Creators</p>
+          <p className="font-mono text-xs text-[#FF552E] tracking-[0.2em] uppercase mb-4">Purpose-Built for AI Creators</p>
           <h2
             className="font-serif text-3xl md:text-4xl lg:text-5xl mb-20 md:mb-28"
             style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}
           >
             The workflow gaps<br />
-            <span style={{
-              background: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>your AI tools don&rsquo;t fill.</span>
+            <span className="text-[#FF552E]">your AI tools don&rsquo;t fill.</span>
           </h2>
         </FadeSection>
 
         <div className="space-y-20 lg:space-y-28">
           {TOOLS.map((tool, idx) => {
             const Icon = tool.icon;
-            const c = tool.color;
             return (
               <div key={tool.label}>
                 <FadeSection>
                 <div className={idx > 0 ? 'pt-20 lg:pt-28' : ''}>
-                  {/* Gradient separator */}
+                  {/* Subtle separator */}
                   {idx > 0 && (
-                    <div className="w-full h-px mb-20 lg:mb-28" style={{
-                      background: `linear-gradient(90deg, ${c}40, ${c}10, transparent)`,
-                    }} />
+                    <div className="w-full h-px mb-20 lg:mb-28 bg-[#27272a]" />
                   )}
 
-                  {/* Feature header */}
+                  {/* Feature header — matches app canvas header style */}
                   <div className="flex items-center gap-3 mb-3">
-                    <span className="font-mono text-[10px] text-white px-2 py-0.5 tracking-wider font-semibold" style={{
-                      background: `linear-gradient(135deg, ${c}, ${c}BB)`,
-                      boxShadow: `0 0 12px ${c}30`,
-                    }}>{tool.num}</span>
-                    <Icon size={16} strokeWidth={1.5} style={{ color: c }} />
-                    <span className="font-mono text-[10px] tracking-[0.2em]" style={{ color: c }}>{tool.label}</span>
+                    <span className="font-mono text-[10px] text-white px-2 py-0.5 tracking-wider font-semibold bg-[#FF552E]">{tool.num}</span>
+                    <Icon size={16} strokeWidth={1.5} className="text-[#FF552E]" />
+                    <span className="font-mono text-[10px] tracking-[0.2em] text-[#FF552E]">{tool.label}</span>
+                    <div className="h-px w-8 bg-[#FF552E]" />
                   </div>
-                  <h3 className="font-serif text-2xl md:text-3xl mb-10" style={{ letterSpacing: '-0.03em' }}>
+                  <h3 className="font-serif text-2xl md:text-3xl mb-10 text-[#f4f4f5]" style={{ letterSpacing: '-0.03em' }}>
                     {tool.tagline}
                   </h3>
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12">
-                    {/* Pain card */}
-                    <div className="relative overflow-hidden p-6 md:p-8 card-hover-subtle group/pain" style={{
-                      border: `1px solid ${c}20`,
-                      background: `linear-gradient(135deg, ${c}08, transparent)`,
+                    {/* Pain card — liquid glass */}
+                    <div className="relative overflow-hidden p-6 md:p-8 card-hover-subtle group/pain backdrop-blur-xl" style={{
+                      border: '1px solid rgba(255,85,46,0.15)',
+                      background: 'rgba(18,18,21,0.55)',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04)',
                     }}>
-                      <div className="absolute top-0 left-0 w-1 h-full transition-all duration-500 group-hover/pain:w-1.5" style={{
-                        background: `linear-gradient(180deg, ${c}80, ${c}20)`,
-                      }} />
+                      <div className="absolute top-0 left-0 w-1 h-full bg-[#FF552E] transition-all duration-500 group-hover/pain:w-1.5" />
                       <div className="flex items-center gap-2 mb-4">
-                        <AlertTriangle size={14} style={{ color: `${c}BB` }} />
-                        <span className="font-mono text-[10px] tracking-[0.15em] uppercase" style={{ color: `${c}BB` }}>The Problem</span>
+                        <AlertTriangle size={14} className="text-[#FF552E]/70" />
+                        <span className="font-mono text-[10px] tracking-[0.15em] uppercase text-[#FF552E]/70">The Problem</span>
                       </div>
                       <h4 className="text-lg font-semibold text-[#f4f4f5] mb-3">{tool.pain.headline}</h4>
                       <p className="text-[#a1a1a1] text-sm leading-relaxed">{tool.pain.desc}</p>
@@ -811,8 +830,8 @@ function FeaturesSection() {
                     <div className="flex flex-col">
                       <div className="mb-6">
                         <div className="flex items-center gap-2 mb-4">
-                          <Zap size={14} style={{ color: c }} />
-                          <span className="font-mono text-[10px] tracking-[0.15em] uppercase" style={{ color: c }}>The Fix</span>
+                          <Zap size={14} className="text-[#FF552E]" />
+                          <span className="font-mono text-[10px] tracking-[0.15em] uppercase text-[#FF552E]">The Fix</span>
                         </div>
                         <h4 className="text-lg font-semibold text-[#f4f4f5] mb-3">{tool.solution.headline}</h4>
                         <p className="text-[#a1a1a1] text-sm leading-relaxed">{tool.solution.desc}</p>
@@ -827,34 +846,35 @@ function FeaturesSection() {
                             onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateX(0)'; }}
                           >
                             <div className="w-5 h-5 flex items-center justify-center shrink-0 transition-all duration-300 group-hover/benefit:scale-110" style={{
-                              border: `1px solid ${c}40`,
-                              background: `${c}15`,
+                              border: '1px solid rgba(255,85,46,0.3)',
+                              background: 'rgba(255,85,46,0.1)',
                             }}>
-                              <Check size={10} strokeWidth={2.5} style={{ color: c }} />
+                              <Check size={10} strokeWidth={2.5} className="text-[#FF552E]" />
                             </div>
                             <span className="text-sm text-[#f4f4f5] transition-colors duration-300 group-hover/benefit:text-white">{b}</span>
                           </div>
                         ))}
                       </div>
 
-                      {/* Step flow */}
-                      <div className="pt-6" style={{ borderTop: `1px solid ${c}15` }}>
-                        <span className="font-mono text-[9px] tracking-[0.15em] uppercase block mb-4" style={{ color: `${c}88` }}>Workflow</span>
+                      {/* Step flow — liquid glass chips */}
+                      <div className="pt-6 border-t border-[#27272a]">
+                        <span className="font-mono text-[9px] tracking-[0.15em] uppercase block mb-4 text-[#a1a1a1]">Workflow</span>
                         <div className="flex items-center gap-2 flex-wrap">
                           {tool.steps.map((step, j) => (
                             <React.Fragment key={j}>
-                              <div className="flex items-center gap-2 px-3 py-2 card-hover-subtle cursor-default" style={{
-                                background: `${c}08`,
-                                border: `1px solid ${c}20`,
+                              <div className="flex items-center gap-2 px-3 py-2 card-hover-subtle cursor-default backdrop-blur-sm" style={{
+                                background: 'rgba(18,18,21,0.7)',
+                                border: '1px solid rgba(255,85,46,0.2)',
+                                boxShadow: '0 2px 8px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04)',
                               }}
-                                onMouseEnter={(e) => { e.currentTarget.style.background = `${c}15`; e.currentTarget.style.borderColor = `${c}40`; }}
-                                onMouseLeave={(e) => { e.currentTarget.style.background = `${c}08`; e.currentTarget.style.borderColor = `${c}20`; }}
+                                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,85,46,0.1)'; e.currentTarget.style.borderColor = 'rgba(255,85,46,0.4)'; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(18,18,21,0.7)'; e.currentTarget.style.borderColor = 'rgba(255,85,46,0.2)'; }}
                               >
-                                <span className="font-mono text-[10px] font-semibold" style={{ color: c }}>{j + 1}</span>
+                                <span className="font-mono text-[10px] font-semibold text-[#FF552E]">{j + 1}</span>
                                 <span className="text-xs text-[#a1a1a1]">{step}</span>
                               </div>
                               {j < tool.steps.length - 1 && (
-                                <ArrowRight size={12} style={{ color: `${c}50` }} className="shrink-0 transition-transform duration-300" />
+                                <ArrowRight size={12} className="text-[#FF552E]/50 shrink-0 transition-transform duration-300" />
                               )}
                             </React.Fragment>
                           ))}
@@ -893,42 +913,41 @@ function ComparisonSection() {
   return (
     <FadeSection>
       <section className="relative py-24 md:py-32 overflow-hidden">
-        {/* Gradient top border */}
-        <div className="absolute top-0 left-0 right-0 h-px" style={{
-          background: 'linear-gradient(90deg, transparent, rgba(244,63,94,0.3), rgba(16,185,129,0.3), transparent)',
-        }} />
-        {/* Decorative glow */}
+        {/* Top accent border */}
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[#FF552E]/40 to-transparent" />
+        {/* Single accent glow */}
         <div className="absolute top-0 right-[20%] w-[300px] h-[300px] pointer-events-none" style={{
-          background: 'radial-gradient(circle, rgba(16,185,129,0.05) 0%, transparent 70%)',
+          background: 'radial-gradient(circle, rgba(255,85,46,0.06) 0%, transparent 70%)',
           animation: 'float2 20s ease-in-out infinite',
+          filter: 'blur(40px)',
         }} />
 
         <div className="relative max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
           <div className="text-center mb-16">
-            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4" style={{
-              background: 'linear-gradient(135deg, #F43F5E, #FF552E)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>Your AI Workflow, Before &amp; After</p>
+            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4 text-[#FF552E]">Your AI Workflow, Before &amp; After</p>
             <h2 className="font-serif text-3xl md:text-4xl lg:text-5xl" style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}>
               Stop duct-taping around your AI tools.
             </h2>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-0">
-            {/* Without */}
-            <div className="border border-[#262626] md:border-r-0 bg-[#0a0a0a] p-8 md:p-10 comparison-hover hover:border-[#F43F5E]/20">
+            {/* Without — muted neutral glass */}
+            <div className="relative p-8 md:p-10 comparison-hover backdrop-blur-xl overflow-hidden" style={{
+              border: '1px solid #27272a',
+              background: 'rgba(15,15,18,0.5)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.03)',
+            }}>
               <div className="flex items-center gap-2 mb-8">
-                <div className="w-6 h-6 border border-[#F43F5E]/20 bg-[#F43F5E]/10 flex items-center justify-center">
-                  <X size={12} className="text-[#F43F5E]" />
+                <div className="w-6 h-6 border border-[#3a3a3a] bg-[#1a1a1a] flex items-center justify-center">
+                  <X size={12} className="text-[#888]" />
                 </div>
-                <span className="font-mono text-[10px] text-[#F43F5E]/70 tracking-[0.15em] uppercase">Without Laniameda</span>
+                <span className="font-mono text-[10px] text-[#888] tracking-[0.15em] uppercase">Without Laniameda</span>
               </div>
               <ul className="space-y-4">
                 {without.map((item, i) => (
                   <li key={i} className="flex items-start gap-3 transition-all duration-200 hover:translate-x-1 cursor-default">
-                    <div className="w-5 h-5 border border-[#F43F5E]/20 bg-[#F43F5E]/5 flex items-center justify-center shrink-0 mt-0.5">
-                      <X size={10} strokeWidth={2} className="text-[#F43F5E]/50" />
+                    <div className="w-5 h-5 border border-[#3a3a3a] bg-[#1a1a1a] flex items-center justify-center shrink-0 mt-0.5">
+                      <X size={10} strokeWidth={2} className="text-[#666]" />
                     </div>
                     <span className="text-sm text-[#666] leading-relaxed line-through decoration-[#333]">{item}</span>
                   </li>
@@ -936,33 +955,34 @@ function ComparisonSection() {
               </ul>
             </div>
 
-            {/* With */}
-            <div className="relative p-8 md:p-10 overflow-hidden comparison-hover" style={{
-              border: '1px solid rgba(16,185,129,0.2)',
-              background: 'linear-gradient(135deg, rgba(16,185,129,0.04), rgba(6,182,212,0.02))',
+            {/* With — orange-accent liquid glass */}
+            <div className="relative p-8 md:p-10 overflow-hidden comparison-hover backdrop-blur-xl" style={{
+              border: '1px solid rgba(255,85,46,0.3)',
+              background: 'rgba(56,26,18,0.5)',
+              boxShadow: '0 8px 32px rgba(255,85,46,0.12), inset 0 1px 0 rgba(255,255,255,0.05)',
             }}>
               {/* Corner glow */}
               <div className="absolute -top-20 -right-20 w-40 h-40 pointer-events-none" style={{
-                background: 'radial-gradient(circle, rgba(16,185,129,0.1) 0%, transparent 70%)',
+                background: 'radial-gradient(circle, rgba(255,85,46,0.18) 0%, transparent 70%)',
               }} />
               <div className="relative">
                 <div className="flex items-center gap-2 mb-8">
                   <div className="w-6 h-6 flex items-center justify-center" style={{
-                    background: 'linear-gradient(135deg, rgba(16,185,129,0.15), rgba(6,182,212,0.1))',
-                    border: '1px solid rgba(16,185,129,0.3)',
+                    background: 'rgba(255,85,46,0.15)',
+                    border: '1px solid rgba(255,85,46,0.4)',
                   }}>
-                    <Zap size={12} className="text-emerald-400" />
+                    <Zap size={12} className="text-[#FF552E]" />
                   </div>
-                  <span className="font-mono text-[10px] text-emerald-400 tracking-[0.15em] uppercase">With Laniameda</span>
+                  <span className="font-mono text-[10px] text-[#FF552E] tracking-[0.15em] uppercase">With Laniameda</span>
                 </div>
                 <ul className="space-y-4">
                   {withLaniameda.map((item, i) => (
                     <li key={i} className="flex items-start gap-3 transition-all duration-200 hover:translate-x-1 cursor-default">
                       <div className="w-5 h-5 flex items-center justify-center shrink-0 mt-0.5 transition-transform duration-300 hover:scale-110" style={{
-                        border: '1px solid rgba(16,185,129,0.3)',
-                        background: 'rgba(16,185,129,0.1)',
+                        border: '1px solid rgba(255,85,46,0.4)',
+                        background: 'rgba(255,85,46,0.12)',
                       }}>
-                        <Check size={10} strokeWidth={2.5} className="text-emerald-400" />
+                        <Check size={10} strokeWidth={2.5} className="text-[#FF552E]" />
                       </div>
                       <span className="text-sm text-[#f4f4f5] leading-relaxed">{item}</span>
                     </li>
@@ -970,125 +990,6 @@ function ComparisonSection() {
                 </ul>
               </div>
             </div>
-          </div>
-        </div>
-      </section>
-    </FadeSection>
-  );
-}
-
-/* ── Testimonials Section ── */
-function TestimonialsSection() {
-  const testimonials = [
-    {
-      quote: "I was tab-switching to Figma every time I needed a Midjourney reference sheet. Now I drag my generations in, auto-stitch, and paste back. 10 minutes down to 10 seconds.",
-      name: 'Sarah K.',
-      role: 'AI Artist \u2014 Midjourney & Ideogram',
-      initials: 'SK',
-      gradient: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-      glow: 'rgba(255,85,46,0.15)',
-    },
-    {
-      quote: "The crop-and-stitch workflow is the missing piece. I isolate the exact region, send it to the model in isolation, import the result \u2014 zero drift. This is how AI editing should work.",
-      name: 'Marcus T.',
-      role: 'Creative Engineer \u2014 Diffusion Models',
-      initials: 'MT',
-      gradient: 'linear-gradient(135deg, #06B6D4, #3B82F6)',
-      glow: 'rgba(6,182,212,0.15)',
-    },
-    {
-      quote: "I generate 50+ images a day across Midjourney and Ideogram. Laniameda is the only tool that fits how I actually work \u2014 fast, local, no friction between me and the model.",
-      name: 'Alex R.',
-      role: 'Prompt Engineer & AI Content Creator',
-      initials: 'AR',
-      gradient: 'linear-gradient(135deg, #8B5CF6, #EC4899)',
-      glow: 'rgba(139,92,246,0.15)',
-    },
-  ];
-
-  return (
-    <FadeSection>
-      <section className="relative py-24 md:py-32 overflow-hidden">
-        {/* Plus pattern background */}
-        <BackgroundPlus
-          plusColor="#06B6D4"
-          plusSize={90}
-          fade={true}
-          className="opacity-[0.03] pointer-events-none"
-        />
-        {/* Gradient top border */}
-        <div className="absolute top-0 left-0 right-0 h-px" style={{
-          background: 'linear-gradient(90deg, transparent, rgba(139,92,246,0.3), rgba(255,85,46,0.3), transparent)',
-        }} />
-        {/* Decorative glow */}
-        <div className="absolute bottom-0 left-[30%] w-[500px] h-[300px] pointer-events-none" style={{
-          background: 'radial-gradient(ellipse, rgba(139,92,246,0.04) 0%, transparent 70%)',
-          animation: 'float1 24s ease-in-out infinite',
-        }} />
-
-        <div className="relative max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
-          <div className="text-center mb-16">
-            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4" style={{
-              background: 'linear-gradient(135deg, #8B5CF6, #EC4899)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>From AI Creators</p>
-            <h2 className="font-serif text-3xl md:text-4xl lg:text-5xl" style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}>
-              Built by creators,{' '}
-              <span style={{
-                background: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-              }}>for creators.</span>
-            </h2>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {testimonials.map((t, i) => (
-              <div key={i} className="relative border border-[#262626] bg-[#0a0a0a] p-8 flex flex-col overflow-hidden group card-hover hover:border-[#333]">
-                {/* Gradient top border accent */}
-                <div className="absolute top-0 left-0 right-0 h-[2px] transition-all duration-500 group-hover:h-[3px]" style={{ background: t.gradient }} />
-
-                {/* Hover corner glow */}
-                <div className="absolute -top-20 -right-20 w-40 h-40 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-500" style={{
-                  background: `radial-gradient(circle, ${t.glow} 0%, transparent 70%)`,
-                }} />
-
-                {/* Decorative quote mark */}
-                <div className="absolute top-4 right-6 font-serif text-7xl leading-none pointer-events-none select-none transition-opacity duration-500 group-hover:opacity-[0.15]" style={{
-                  background: t.gradient,
-                  WebkitBackgroundClip: 'text',
-                  WebkitTextFillColor: 'transparent',
-                  opacity: 0.08,
-                }}>&ldquo;</div>
-
-                {/* Stars */}
-                <div className="flex gap-0.5 mb-6">
-                  {[...Array(5)].map((_, j) => (
-                    <Star key={j} size={12} fill="#F59E0B" strokeWidth={0} className="text-[#F59E0B] transition-transform duration-300" style={{ transitionDelay: `${j * 50}ms` }} />
-                  ))}
-                </div>
-
-                {/* Quote */}
-                <p className="text-sm text-[#c4c4c4] leading-relaxed flex-1 mb-8 transition-colors duration-300 group-hover:text-[#d4d4d4]">
-                  &ldquo;{t.quote}&rdquo;
-                </p>
-
-                {/* Author */}
-                <div className="flex items-center gap-3 pt-6 border-t border-[#1a1a1a] transition-colors duration-300 group-hover:border-[#262626]">
-                  <div className="w-10 h-10 flex items-center justify-center transition-all duration-300 group-hover:scale-105" style={{
-                    background: t.gradient,
-                    boxShadow: `0 0 20px ${t.glow}`,
-                  }}>
-                    <span className="font-mono text-[11px] text-white font-semibold">{t.initials}</span>
-                  </div>
-                  <div>
-                    <p className="text-sm font-medium text-[#f4f4f5]">{t.name}</p>
-                    <p className="text-xs text-[#888] transition-colors duration-300 group-hover:text-[#999]">{t.role}</p>
-                  </div>
-                </div>
-              </div>
-            ))}
           </div>
         </div>
       </section>
@@ -1108,47 +1009,37 @@ function BuiltForSection() {
     {
       title: 'AI Artists & Illustrators',
       desc: 'You generate dozens of variations and need to combine them into reference sheets, mood boards, and composite layouts \u2014 fast.',
-      color: '#06B6D4',
+      color: '#FF8A6C',
       icon: Layers,
     },
     {
       title: 'Prompt Engineers',
       desc: 'You iterate across Midjourney, Ideogram, and Firefly. You need a workspace that keeps up with your generation speed.',
-      color: '#8B5CF6',
+      color: '#FFB8A3',
       icon: Zap,
     },
     {
       title: 'Creative Engineers',
       desc: 'You ship AI-generated content into production. You need reliable image prep tooling that runs locally, no API keys, no servers.',
-      color: '#F59E0B',
+      color: '#FF552E',
       icon: BoxSelect,
     },
   ];
 
   return (
     <FadeSection>
-      <section className="relative py-24 md:py-32 overflow-hidden" style={{ borderBottom: '1px solid #262626' }}>
-        {/* Plus pattern background */}
-        <BackgroundPlus
-          plusColor="#8B5CF6"
-          plusSize={100}
-          fade={true}
-          className="opacity-[0.025] pointer-events-none"
-        />
+      <section className="relative py-24 md:py-32 overflow-hidden" style={{ borderBottom: '1px solid #27272a' }}>
+        {/* Grid background — matches app canvas */}
+        <div className="absolute inset-0 pointer-events-none opacity-[0.03]" style={{
+          backgroundSize: '50px 50px',
+          backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.5) 1px, transparent 1px)',
+        }} />
         <div className="relative max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
           <div className="text-center mb-16">
-            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4" style={{
-              background: 'linear-gradient(135deg, #FF552E, #8B5CF6)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>Who This Is For</p>
+            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4 text-[#FF552E]">Who This Is For</p>
             <h2 className="font-serif text-3xl md:text-4xl lg:text-5xl" style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}>
               If you create with AI,{' '}
-              <span style={{
-                background: 'linear-gradient(135deg, #FF552E, #F59E0B)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-              }}>this is your workspace.</span>
+              <span className="text-[#FF552E]">this is your workspace.</span>
             </h2>
           </div>
 
@@ -1156,10 +1047,15 @@ function BuiltForSection() {
             {personas.map((p) => {
               const Icon = p.icon;
               return (
-                <div key={p.title} className="relative p-6 md:p-8 border border-[#262626] bg-[#0a0a0a] group card-hover-subtle overflow-hidden cursor-default"
-                  style={{ transition: 'transform 0.35s cubic-bezier(0.16,1,0.3,1), box-shadow 0.35s ease, border-color 0.35s ease' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${p.color}40`; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#262626'; }}
+                <div key={p.title} className="relative p-6 md:p-8 group card-hover-subtle overflow-hidden cursor-default backdrop-blur-xl"
+                  style={{
+                    border: '1px solid #27272a',
+                    background: 'rgba(15,15,18,0.55)',
+                    boxShadow: '0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04)',
+                    transition: 'transform 0.35s cubic-bezier(0.16,1,0.3,1), box-shadow 0.35s ease, border-color 0.35s ease',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${p.color}60`; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#27272a'; }}
                 >
                   {/* Accent top line */}
                   <div className="absolute top-0 left-0 h-[2px] transition-all duration-500 ease-out group-hover:w-full" style={{ background: p.color, width: '48px' }} />
@@ -1194,11 +1090,11 @@ function FAQSection() {
   const faqs = [
     {
       q: "Is it really free? What's the catch?",
-      a: "Completely free, no catch. Laniameda runs entirely in your browser with no servers, accounts, or data collection. We monetize through our companion product, laniameda.prompt.",
+      a: "Completely free, no catch. Laniameda runs entirely in your browser with no servers, accounts, or data collection.",
     },
     {
       q: 'Do my images get uploaded anywhere?',
-      a: "Never. All image processing happens 100% client-side using the Canvas API. Your images never leave your browser. We literally cannot see them.",
+      a: "Never. All image processing happens in your browser using the Canvas API. Your images never leave your machine. We literally cannot see them.",
     },
     {
       q: 'Does it work with tools other than Midjourney?',
@@ -1218,18 +1114,12 @@ function FAQSection() {
   return (
     <FadeSection>
       <section className="relative py-24 md:py-32 overflow-hidden">
-        {/* Gradient top border */}
-        <div className="absolute top-0 left-0 right-0 h-px" style={{
-          background: 'linear-gradient(90deg, transparent, rgba(6,182,212,0.3), transparent)',
-        }} />
+        {/* Top accent border */}
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[#FF552E]/30 to-transparent" />
 
         <div className="relative max-w-[800px] mx-auto px-6 md:px-12 lg:px-16">
           <div className="text-center mb-16">
-            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4" style={{
-              background: 'linear-gradient(135deg, #06B6D4, #3B82F6)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>FAQ</p>
+            <p className="font-mono text-xs tracking-[0.2em] uppercase mb-4 text-[#FF552E]">FAQ</p>
             <h2 className="font-serif text-3xl md:text-4xl" style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}>
               Common questions.
             </h2>
@@ -1238,24 +1128,21 @@ function FAQSection() {
           <div className="space-y-0">
             {faqs.map((faq, i) => (
               <div key={i} className="relative" style={{
-                borderBottom: `1px solid ${open === i ? 'rgba(6,182,212,0.2)' : '#262626'}`,
+                borderBottom: `1px solid ${open === i ? 'rgba(255,85,46,0.3)' : '#27272a'}`,
                 transition: 'border-color 0.2s',
               }}>
                 {/* Active indicator */}
                 {open === i && (
-                  <div className="absolute left-0 top-0 bottom-0 w-[2px]" style={{
-                    background: 'linear-gradient(180deg, #06B6D4, #3B82F6)',
-                  }} />
+                  <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-[#FF552E]" />
                 )}
                 <button
                   onClick={() => setOpen(open === i ? null : i)}
                   className="w-full flex items-center justify-between py-6 text-left cursor-pointer group/faq pl-4"
                 >
-                  <span className={`text-sm md:text-base font-medium pr-4 transition-colors duration-300 ${open === i ? 'text-[#06B6D4]' : 'text-[#f4f4f5] group-hover/faq:text-[#06B6D4]/70'}`}>{faq.q}</span>
+                  <span className={`text-sm md:text-base font-medium pr-4 transition-colors duration-300 ${open === i ? 'text-[#FF552E]' : 'text-[#f4f4f5] group-hover/faq:text-[#FF552E]/70'}`}>{faq.q}</span>
                   <ChevronDown
                     size={16}
-                    className={`shrink-0 transition-all duration-400 ease-out ${open === i ? 'rotate-180' : 'text-[#888] group-hover/faq:text-[#06B6D4]/50'}`}
-                    style={open === i ? { color: '#06B6D4' } : undefined}
+                    className={`shrink-0 transition-all duration-400 ease-out ${open === i ? 'rotate-180 text-[#FF552E]' : 'text-[#888] group-hover/faq:text-[#FF552E]/50'}`}
                   />
                 </button>
                 <div
@@ -1381,31 +1268,30 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
         }
       `}</style>
 
-      {/* ═══ ANIMATED BACKGROUND ═══ */}
+      {/* ═══ ANIMATED BACKGROUND — orange-only, app palette ═══ */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }} aria-hidden="true">
-        <div className="absolute rounded-full" style={{ width: 700, height: 700, top: '-8%', left: '-5%', background: 'radial-gradient(circle, rgba(255,85,46,0.045) 0%, transparent 60%)', animation: 'float1 22s ease-in-out infinite', filter: 'blur(80px)' }} />
-        <div className="absolute rounded-full" style={{ width: 550, height: 550, top: '22%', right: '-6%', background: 'radial-gradient(circle, rgba(6,182,212,0.04) 0%, transparent 60%)', animation: 'float2 30s ease-in-out infinite', filter: 'blur(80px)' }} />
-        <div className="absolute rounded-full" style={{ width: 650, height: 650, top: '48%', left: '3%', background: 'radial-gradient(circle, rgba(139,92,246,0.035) 0%, transparent 60%)', animation: 'float3 26s ease-in-out infinite', filter: 'blur(80px)' }} />
-        <div className="absolute rounded-full" style={{ width: 500, height: 500, top: '70%', right: '12%', background: 'radial-gradient(circle, rgba(245,158,11,0.03) 0%, transparent 60%)', animation: 'float1 34s ease-in-out infinite', filter: 'blur(80px)' }} />
-        <div className="absolute rounded-full" style={{ width: 400, height: 400, bottom: '-5%', left: '35%', background: 'radial-gradient(circle, rgba(236,72,153,0.025) 0%, transparent 60%)', animation: 'float2 28s ease-in-out infinite', filter: 'blur(80px)' }} />
+        <div className="absolute rounded-full" style={{ width: 700, height: 700, top: '-8%', left: '-5%', background: 'radial-gradient(circle, rgba(255,85,46,0.06) 0%, transparent 60%)', animation: 'float1 22s ease-in-out infinite', filter: 'blur(80px)' }} />
+        <div className="absolute rounded-full" style={{ width: 550, height: 550, top: '30%', right: '-6%', background: 'radial-gradient(circle, rgba(255,85,46,0.04) 0%, transparent 60%)', animation: 'float2 30s ease-in-out infinite', filter: 'blur(80px)' }} />
+        <div className="absolute rounded-full" style={{ width: 650, height: 650, top: '60%', left: '3%', background: 'radial-gradient(circle, rgba(255,138,108,0.03) 0%, transparent 60%)', animation: 'float3 26s ease-in-out infinite', filter: 'blur(80px)' }} />
+        <div className="absolute rounded-full" style={{ width: 400, height: 400, bottom: '-5%', right: '15%', background: 'radial-gradient(circle, rgba(255,85,46,0.035) 0%, transparent 60%)', animation: 'float1 34s ease-in-out infinite', filter: 'blur(80px)' }} />
       </div>
 
-      {/* Floating particles */}
+      {/* Floating particles — orange only */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }} aria-hidden="true">
         {[
-          { x: '12%', y: '18%', c: '#FF552E', s: 3, d: 18, f: 1 },
-          { x: '85%', y: '24%', c: '#06B6D4', s: 2, d: 23, f: 2 },
-          { x: '28%', y: '55%', c: '#8B5CF6', s: 2.5, d: 20, f: 3 },
-          { x: '75%', y: '65%', c: '#F59E0B', s: 2, d: 25, f: 1 },
-          { x: '48%', y: '35%', c: '#FF552E', s: 1.5, d: 28, f: 2 },
-          { x: '15%', y: '80%', c: '#06B6D4', s: 2, d: 19, f: 3 },
-          { x: '62%', y: '10%', c: '#EC4899', s: 1.5, d: 32, f: 1 },
-          { x: '52%', y: '88%', c: '#8B5CF6', s: 2, d: 21, f: 2 },
+          { x: '12%', y: '18%', s: 3, d: 18, f: 1 },
+          { x: '85%', y: '24%', s: 2, d: 23, f: 2 },
+          { x: '28%', y: '55%', s: 2.5, d: 20, f: 3 },
+          { x: '75%', y: '65%', s: 2, d: 25, f: 1 },
+          { x: '48%', y: '35%', s: 1.5, d: 28, f: 2 },
+          { x: '15%', y: '80%', s: 2, d: 19, f: 3 },
+          { x: '62%', y: '10%', s: 1.5, d: 32, f: 1 },
+          { x: '52%', y: '88%', s: 2, d: 21, f: 2 },
         ].map((p, i) => (
           <div key={i} className="absolute rounded-full" style={{
             left: p.x, top: p.y, width: p.s, height: p.s,
-            background: p.c, opacity: 0.3,
-            boxShadow: `0 0 ${p.s * 5}px ${p.c}40`,
+            background: '#FF552E', opacity: 0.3,
+            boxShadow: `0 0 ${p.s * 5}px rgba(255,85,46,0.4)`,
             animation: `float${p.f} ${p.d}s ease-in-out infinite`,
           }} />
         ))}
@@ -1414,18 +1300,9 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
       {/* ═══ ANNOUNCEMENT BAR ═══ */}
       <div className="fixed top-0 left-0 right-0 z-[60] bg-[#FF552E]">
         <div className="max-w-[1400px] mx-auto flex items-center justify-center gap-3 px-6 h-9">
-          <span className="font-mono text-[10px] text-white/80 tracking-[0.15em] uppercase hidden sm:inline">New</span>
+          <span className="font-mono text-[10px] text-white/80 tracking-[0.15em] uppercase hidden sm:inline">Heads up</span>
           <span className="text-white/30 hidden sm:inline">|</span>
-          <span className="text-white text-xs font-medium">laniameda.prompt &mdash; Your AI prompt library, powered by Telegram</span>
-          <a
-            href="https://laniameda.storage"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="group/ann inline-flex items-center gap-1 text-white text-xs font-semibold underline underline-offset-2 decoration-white/50 hover:decoration-white transition-all duration-200"
-          >
-            Learn more
-            <ExternalLink size={11} className="transition-transform duration-200 group-hover/ann:translate-x-0.5 group-hover/ann:-translate-y-0.5" />
-          </a>
+          <span className="text-white text-xs font-medium">this is WIP &mdash; the project evolves as i iterate while using it in my creative work</span>
         </div>
       </div>
 
@@ -1519,10 +1396,10 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
                   }}
                 />
                 <div className="relative">
-                  <AppMockup />
+                  <AppPreview />
                 </div>
                 <p className="text-center font-mono text-[10px] text-[#888] tracking-[0.12em] uppercase mt-4">
-                  Click tabs to preview each tool
+                  Live app · interact with the real tools
                 </p>
               </div>
             </FadeSection>
@@ -1539,8 +1416,8 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
           <div className="relative max-w-[1400px] mx-auto flex items-center justify-center gap-6 md:gap-10 py-5 px-6">
             {[
               { text: 'Works with Midjourney, Ideogram, Firefly & more', color: '#FF552E' },
-              { text: 'Zero Install', color: '#06B6D4' },
-              { text: 'Your Images Never Leave Your Browser', color: '#8B5CF6' },
+              { text: 'Zero Install', color: '#FF8A6C' },
+              { text: 'Your Images Never Leave Your Browser', color: '#FFB8A3' },
             ].map((item, i) => (
               <React.Fragment key={item.text}>
                 {i > 0 && <span className="text-[#333]">&middot;</span>}
@@ -1562,11 +1439,11 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
             <div className="flex flex-wrap items-center justify-center gap-x-8 md:gap-x-12 gap-y-3">
               {[
                 { name: 'Midjourney', color: '#FF552E' },
-                { name: 'GPT-4o Images', color: '#06B6D4' },
-                { name: 'Ideogram 3', color: '#8B5CF6' },
-                { name: 'Adobe Firefly', color: '#F59E0B' },
-                { name: 'Leonardo AI', color: '#EC4899' },
-                { name: 'ComfyUI', color: '#10B981' },
+                { name: 'GPT-4o Images', color: '#FF8A6C' },
+                { name: 'Ideogram 3', color: '#FFB8A3' },
+                { name: 'Adobe Firefly', color: '#FF552E' },
+                { name: 'Leonardo AI', color: '#FF8A6C' },
+                { name: 'ComfyUI', color: '#FFB8A3' },
               ].map((tool) => (
                 <span
                   key={tool.name}
@@ -1595,44 +1472,6 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
       {/* ═══ COMPARISON ═══ */}
       <ComparisonSection />
 
-      {/* ═══ TESTIMONIALS ═══ */}
-      <TestimonialsSection />
-
-      {/* ═══ AFFILIATE — laniameda.prompt ═══ */}
-      <FadeSection>
-        <section className="border-t border-[#262626] py-20 md:py-28">
-          <div className="max-w-[1200px] mx-auto px-6 md:px-12 lg:px-16">
-            <div className="text-center mb-12">
-              <p className="font-mono text-xs text-[#888] tracking-[0.2em] uppercase mb-4">From the Makers of Laniameda</p>
-              <h2
-                className="font-serif text-3xl md:text-4xl lg:text-5xl mb-6"
-                style={{ letterSpacing: '-0.04em', lineHeight: 1.1 }}
-              >
-                Looking for a place to<br />
-                <span className="text-[#FF552E]">store your prompts?</span>
-              </h2>
-              <p className="text-[#a1a1a1] text-base md:text-lg max-w-lg mx-auto leading-relaxed">
-                The Pinterest for AI creators. Store prompts, browse generations, transfer styles between projects &mdash; powered by a Telegram bot that works as your personal AI agent.
-              </p>
-            </div>
-
-            <PromptFeatures />
-
-            <div className="text-center mt-4">
-              <a
-                href="https://laniameda.storage"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="btn-glow group inline-flex items-center gap-3 border border-[#FF552E] text-[#FF552E] text-sm font-semibold uppercase tracking-[0.1em] px-8 py-3.5 hover:bg-[#FF552E] hover:text-white hover:shadow-[0_0_30px_rgba(255,85,46,0.25)] transition-all duration-300"
-              >
-                Try laniameda.prompt
-                <ArrowRight size={16} strokeWidth={1.5} className="group-hover:translate-x-1.5 transition-transform duration-300 ease-out" />
-              </a>
-            </div>
-          </div>
-        </section>
-      </FadeSection>
-
       {/* ═══ FAQ ═══ */}
       <FAQSection />
 
@@ -1657,13 +1496,14 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
             </p>
             <button
               onClick={onEnter}
-              className="btn-glow group inline-flex items-center gap-3 bg-[#FF552E] text-white text-sm font-semibold uppercase tracking-[0.1em] px-10 py-4 hover:bg-[#e64a27] active:translate-y-px hover:shadow-[0_0_40px_rgba(255,85,46,0.3)] transition-all duration-300 cursor-pointer"
+              className="btn-glow group inline-flex items-center gap-3 bg-[#FF552E] text-white text-sm font-semibold uppercase tracking-[0.1em] px-10 py-4 hover:bg-[#e64a27] active:translate-y-px hover:shadow-[0_0_40px_rgba(255,85,46,0.4)] transition-all duration-300 cursor-pointer"
+              style={{ clipPath: 'polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%)' }}
             >
               Open Laniameda
               <ArrowRight size={16} strokeWidth={1.5} className="group-hover:translate-x-1.5 transition-transform duration-300 ease-out" />
             </button>
             <p className="font-mono text-[11px] text-[#52525b] tracking-[0.15em] uppercase mt-8">
-              No account required &middot; Works with any AI image tool &middot; 100% client-side
+              No account required &middot; Works with any AI image tool
             </p>
           </div>
         </section>
@@ -1673,14 +1513,10 @@ export default function LandingPage({ onEnter }: LandingPageProps) {
       <footer className="border-t border-[#262626] py-12">
         <div className="max-w-[1400px] mx-auto px-6 md:px-12 lg:px-16 flex flex-col sm:flex-row items-center justify-between gap-6">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold tracking-tight">Laniameda</span>
-            <span className="text-[#a1a1a1] text-sm">&mdash; The workflow layer AI image tools don&rsquo;t ship</span>
+            <span className="text-sm font-semibold tracking-tight">laniameda</span>
+            <span className="text-[#a1a1a1] text-sm">&mdash; ai native creative studio</span>
           </div>
           <div className="flex items-center gap-6">
-            <a href="https://laniameda.storage" target="_blank" rel="noopener noreferrer" className="group/footer font-mono text-xs text-[#888] hover:text-[#FF552E] transition-all duration-300 relative">
-              laniameda.prompt
-              <span className="absolute -bottom-0.5 left-0 right-0 h-px bg-[#FF552E] origin-left scale-x-0 group-hover/footer:scale-x-100 transition-transform duration-300 ease-out" />
-            </a>
             <p className="font-mono text-xs text-[#888]">&copy; {new Date().getFullYear()}</p>
           </div>
         </div>
