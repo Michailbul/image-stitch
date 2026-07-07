@@ -466,16 +466,48 @@ export const computeFrameExportScale = (
   return Math.min(scale, maxDimension / longEdge);
 };
 
+/** Annotation payload for export — world coordinates (output pixels). */
+export type FrameAnnotation =
+  | { type: 'line'; x1: number; y1: number; x2: number; y2: number; color: string; width: number }
+  | { type: 'text'; x: number; y: number; text: string; color: string; size: number };
+
+const drawAnnotation = (
+  ctx: CanvasRenderingContext2D,
+  ann: FrameAnnotation,
+  frame: { x: number; y: number },
+  scale: number
+): void => {
+  if (ann.type === 'line') {
+    ctx.save();
+    ctx.strokeStyle = ann.color;
+    ctx.lineWidth = Math.max(1, ann.width * scale);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo((ann.x1 - frame.x) * scale, (ann.y1 - frame.y) * scale);
+    ctx.lineTo((ann.x2 - frame.x) * scale, (ann.y2 - frame.y) * scale);
+    ctx.stroke();
+    ctx.restore();
+  } else {
+    ctx.save();
+    ctx.fillStyle = ann.color;
+    ctx.textBaseline = 'top';
+    ctx.font = `${ann.size * scale}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
+    ctx.fillText(ann.text, (ann.x - frame.x) * scale, (ann.y - frame.y) * scale);
+    ctx.restore();
+  }
+};
+
 /**
  * Renders exactly the frame region: each item drawn cover-fit at its canvas
  * position, scaled so the export meets the requested resolution, clipped to
  * the frame bounds. Single resample from native pixels — no quality loss.
+ * Per-item layer masks and vector annotations are baked in at the same scale.
  */
 export const generateFrameStitch = async (
-  items: Array<FrameExportItem & { dataUrl: string }>,
+  items: Array<FrameExportItem & { dataUrl: string; maskDataUrl?: string }>,
   frame: { x: number; y: number; width: number; height: number },
   backgroundColor: string,
-  options?: { resolution?: 'auto' | number; maxDimension?: number }
+  options?: { resolution?: 'auto' | number; maxDimension?: number; annotations?: FrameAnnotation[] }
 ): Promise<{ dataUrl: string; width: number; height: number }> => {
   const resolution = options?.resolution ?? 'auto';
   const scale = computeFrameExportScale(
@@ -500,14 +532,31 @@ export const generateFrameStitch = async (
 
   for (const item of items) {
     const img = await loadImage(item.dataUrl);
-    drawImageCover(
-      ctx,
-      img,
-      (item.x - frame.x) * scale,
-      (item.y - frame.y) * scale,
-      item.width * scale,
-      item.height * scale
-    );
+    const dx = (item.x - frame.x) * scale;
+    const dy = (item.y - frame.y) * scale;
+    const dw = item.width * scale;
+    const dh = item.height * scale;
+
+    if (item.maskDataUrl) {
+      // Composite image + mask off-screen, then blit — keeps the mask's
+      // destination-in from clipping neighbouring layers.
+      const tmp = document.createElement('canvas');
+      tmp.width = Math.max(1, Math.round(dw));
+      tmp.height = Math.max(1, Math.round(dh));
+      const tctx = prepareCanvasContext(tmp);
+      drawImageCover(tctx, img, 0, 0, tmp.width, tmp.height);
+      const mask = await loadImage(item.maskDataUrl);
+      tctx.globalCompositeOperation = 'destination-in';
+      tctx.drawImage(mask, 0, 0, tmp.width, tmp.height);
+      tctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(tmp, dx, dy);
+    } else {
+      drawImageCover(ctx, img, dx, dy, dw, dh);
+    }
+  }
+
+  for (const ann of options?.annotations ?? []) {
+    drawAnnotation(ctx, ann, frame, scale);
   }
 
   return { dataUrl: canvas.toDataURL('image/png'), width, height };

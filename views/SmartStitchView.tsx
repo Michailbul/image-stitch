@@ -3,12 +3,17 @@ import {
   Upload, Download, Trash2, Settings2, Plus, X, Edit2, MoreVertical,
   Layers, Sparkles, Hand, CheckSquare, Square, MousePointer2, Keyboard,
   ZoomIn, ZoomOut, Maximize2, Check, Eye, LayoutGrid, Crop, Frame as FrameIcon,
+  Brush, PenLine, Type as TypeIcon, Eraser,
 } from 'lucide-react';
-import { Thread, StoredImage, CanvasItem, StitchSettings, SmartStitchImage, FrameSpec } from '../types';
+import { Thread, StoredImage, CanvasItem, StitchSettings, SmartStitchImage, FrameSpec, Annotation } from '../types';
 import {
   generateSmartStitch, generateManualStitch, loadImage, computeJustifiedLayout, cropImage,
-  generateFrameStitch, computeFrameExportScale,
+  generateFrameStitch, computeFrameExportScale, FrameAnnotation,
 } from '../utils/imageUtils';
+
+type Tool = 'select' | 'brush' | 'line' | 'text';
+const MASK_MAX_DIM = 2048; // cap per-item mask resolution; feather hides upscaling
+const EMPTY_ANNOTATIONS: Annotation[] = [];
 import {
   listThreads, saveThread, deleteThread, createThread,
   listImagesByThread, addImage, deleteImage, DEFAULT_SETTINGS,
@@ -56,7 +61,25 @@ export default function SmartStitchView() {
   // Fixed-aspect export frame (persisted per thread)
   const [frame, setFrame] = useState<FrameSpec | null>(null);
   const [isFrameStitching, setIsFrameStitching] = useState(false);
-  const historyRef = useRef<{ canvasItems: CanvasItem[]; images: StoredImage[] }[]>([]);
+  // Tools: select / brush (layer mask) / line / text
+  const [tool, setTool] = useState<Tool>('select');
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [brush, setBrush] = useState({ size: 120, hardness: 0.5, restore: false });
+  const [draw, setDraw] = useState({ color: '#F26157', lineWidth: 6, textSize: 64 });
+  const [pendingLine, setPendingLine] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const [editingText, setEditingText] = useState<string | null>(null);
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [maskEditingItemId, setMaskEditingItemId] = useState<string | null>(null);
+  // Live mask canvases keyed by item id (mutated during a brush stroke, serialized on release)
+  const maskCanvasRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const itemRedrawRef = useRef<Map<string, () => void>>(new Map());
+  const toolRef = useRef(tool);
+  const brushRef = useRef(brush);
+  const annotationsRef = useRef(annotations);
+  useEffect(() => { toolRef.current = tool; }, [tool]);
+  useEffect(() => { brushRef.current = brush; }, [brush]);
+  useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
+  const historyRef = useRef<{ canvasItems: CanvasItem[]; images: StoredImage[]; annotations: Annotation[] }[]>([]);
   const canvasItemsRef = useRef(canvasItems);
   const imagesRef = useRef(images);
 
@@ -79,7 +102,11 @@ export default function SmartStitchView() {
   useEffect(() => { localStorage.setItem('stitch-library-width', String(libraryWidth)); }, [libraryWidth]);
 
   const pushHistory = () => {
-    historyRef.current.push({ canvasItems: canvasItemsRef.current, images: imagesRef.current });
+    historyRef.current.push({
+      canvasItems: canvasItemsRef.current,
+      images: imagesRef.current,
+      annotations: annotationsRef.current,
+    });
     if (historyRef.current.length > 50) historyRef.current.shift();
   };
 
@@ -95,8 +122,11 @@ export default function SmartStitchView() {
       ...toReAdd.map(i => addImage(i)),
       ...toRemove.map(i => deleteImage(i.id)),
     ]);
+    // Reset any live mask canvases so they re-hydrate from restored item state.
+    maskCanvasRef.current.clear();
     setImages(snap.images);
     setCanvasItems(snap.canvasItems);
+    setAnnotations(snap.annotations);
     setAutoPreview(null);
     setSelectedIds(new Set());
   };
@@ -138,10 +168,13 @@ export default function SmartStitchView() {
     if (!activeThreadId) return;
     const thread = threads.find(t => t.id === activeThreadId);
     if (!thread) return;
+    maskCanvasRef.current.clear();
     setCanvasItems(thread.canvasItems);
     setSettings(thread.settings);
     setFrame(thread.frame ?? null);
+    setAnnotations(thread.annotations ?? EMPTY_ANNOTATIONS);
     setSelectedIds(new Set());
+    setSelectedAnnotationId(null);
     setAutoPreview(null);
     setZoom(1);
     setPan({ x: 0, y: 0 });
@@ -158,14 +191,17 @@ export default function SmartStitchView() {
     if (!activeThreadId || autoPreview) return; // don't persist preview state
     const thread = threads.find(t => t.id === activeThreadId);
     if (!thread) return;
-    if (thread.canvasItems === canvasItems && thread.settings === settings && (thread.frame ?? null) === frame) return;
+    if (
+      thread.canvasItems === canvasItems && thread.settings === settings &&
+      (thread.frame ?? null) === frame && (thread.annotations ?? EMPTY_ANNOTATIONS) === annotations
+    ) return;
     const id = setTimeout(() => {
-      const updated: Thread = { ...thread, canvasItems, settings, frame, updatedAt: Date.now() };
+      const updated: Thread = { ...thread, canvasItems, settings, frame, annotations, updatedAt: Date.now() };
       saveThread(updated);
       setThreads(prev => prev.map(t => t.id === updated.id ? updated : t));
     }, 500);
     return () => clearTimeout(id);
-  }, [canvasItems, settings, frame, activeThreadId, threads, autoPreview]);
+  }, [canvasItems, settings, frame, annotations, activeThreadId, threads, autoPreview]);
 
   // --- Close thread menu on outside click ---
   useEffect(() => {
@@ -559,7 +595,7 @@ export default function SmartStitchView() {
     if (!frame || !frameRect || frameItems.length === 0 || isFrameStitching) return;
     setIsFrameStitching(true);
     try {
-      const entries: { dataUrl: string; x: number; y: number; width: number; height: number; nativeWidth: number; nativeHeight: number }[] = [];
+      const entries: { dataUrl: string; x: number; y: number; width: number; height: number; nativeWidth: number; nativeHeight: number; maskDataUrl?: string }[] = [];
       for (const ci of frameItems) {
         const dataUrl = resolveDataUrl(ci);
         if (!dataUrl) continue;
@@ -570,12 +606,22 @@ export default function SmartStitchView() {
           nativeWidth = loaded.width;
           nativeHeight = loaded.height;
         }
-        entries.push({ dataUrl, x: ci.x, y: ci.y, width: ci.width, height: ci.height, nativeWidth, nativeHeight });
+        // Prefer the live mask canvas (freshest) over the serialized copy.
+        const liveMask = maskCanvasRef.current.get(ci.id);
+        const maskDataUrl = liveMask ? liveMask.toDataURL('image/png') : ci.maskDataUrl;
+        entries.push({ dataUrl, x: ci.x, y: ci.y, width: ci.width, height: ci.height, nativeWidth, nativeHeight, maskDataUrl });
       }
       if (entries.length === 0) return;
 
+      // Annotations that touch the frame (drawing clips to the frame anyway).
+      const anns: FrameAnnotation[] = annotations.map(a =>
+        a.type === 'line'
+          ? { type: 'line', x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, color: a.color, width: a.width }
+          : { type: 'text', x: a.x, y: a.y, text: a.text, color: a.color, size: a.size }
+      );
+
       const bg = frame.transparent ? 'transparent' : settings.backgroundColor;
-      const result = await generateFrameStitch(entries, frameRect, bg, { resolution: frame.resolution });
+      const result = await generateFrameStitch(entries, frameRect, bg, { resolution: frame.resolution, annotations: anns });
 
       // Download immediately — the frame is the deliverable.
       const a = document.createElement('a');
@@ -605,6 +651,184 @@ export default function SmartStitchView() {
     }
   };
 
+  // --- Layer-mask brush ---
+  const maskDims = (item: CanvasItem) => {
+    const long = Math.max(item.width, item.height);
+    const s = Math.min(1, MASK_MAX_DIM / Math.max(1, long));
+    return { w: Math.max(1, Math.round(item.width * s)), h: Math.max(1, Math.round(item.height * s)) };
+  };
+
+  const getOrCreateMaskCanvas = (item: CanvasItem): HTMLCanvasElement => {
+    const existing = maskCanvasRef.current.get(item.id);
+    if (existing) return existing;
+    const { w, h } = maskDims(item);
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d')!;
+    ctx.fillStyle = '#fff'; // fully opaque = fully visible
+    ctx.fillRect(0, 0, w, h);
+    maskCanvasRef.current.set(item.id, c);
+    return c;
+  };
+
+  const beginBrushStroke = (e: React.PointerEvent, item: CanvasItem) => {
+    e.stopPropagation();
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    const mask = getOrCreateMaskCanvas(item);
+    const mctx = mask.getContext('2d')!;
+    const b = brushRef.current;
+    setMaskEditingItemId(item.id);
+    setSelectedIds(new Set([item.id]));
+    pushHistory();
+
+    const stamp = (wx: number, wy: number) => {
+      const mx = ((wx - item.x) / item.width) * mask.width;
+      const my = ((wy - item.y) / item.height) * mask.height;
+      const r = Math.max(1, (b.size / 2) * (mask.width / item.width));
+      const solid = Math.min(0.98, Math.max(0, b.hardness));
+      const g = mctx.createRadialGradient(mx, my, 0, mx, my, r);
+      if (b.restore) {
+        g.addColorStop(0, 'rgba(255,255,255,1)');
+        g.addColorStop(solid, 'rgba(255,255,255,1)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        mctx.globalCompositeOperation = 'source-over';
+      } else {
+        g.addColorStop(0, 'rgba(0,0,0,1)');
+        g.addColorStop(solid, 'rgba(0,0,0,1)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        mctx.globalCompositeOperation = 'destination-out';
+      }
+      mctx.fillStyle = g;
+      mctx.beginPath();
+      mctx.arc(mx, my, r, 0, Math.PI * 2);
+      mctx.fill();
+    };
+
+    const start = toWorld(e.clientX, e.clientY);
+    let prev = start;
+    stamp(start.x, start.y);
+    itemRedrawRef.current.get(item.id)?.();
+
+    const onMove = (ev: PointerEvent) => {
+      const p = toWorld(ev.clientX, ev.clientY);
+      const dist = Math.hypot(p.x - prev.x, p.y - prev.y);
+      const step = Math.max(1, b.size * 0.2);
+      const n = Math.max(1, Math.floor(dist / step));
+      for (let i = 1; i <= n; i++) {
+        const t = i / n;
+        stamp(prev.x + (p.x - prev.x) * t, prev.y + (p.y - prev.y) * t);
+      }
+      prev = p;
+      itemRedrawRef.current.get(item.id)?.();
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      mctx.globalCompositeOperation = 'source-over';
+      const url = mask.toDataURL('image/png');
+      setCanvasItems(prevItems => prevItems.map(i => i.id === item.id ? { ...i, maskDataUrl: url } : i));
+      setMaskEditingItemId(null);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const clearMask = (id: string) => {
+    maskCanvasRef.current.delete(id);
+    pushHistory();
+    setCanvasItems(prev => prev.map(i => i.id === id ? { ...i, maskDataUrl: undefined } : i));
+  };
+
+  // --- Line + text tools ---
+  const snapLineEnd = (x1: number, y1: number, x2: number, y2: number, shift: boolean) => {
+    if (!shift) return { x2, y2 };
+    const ang = Math.atan2(y2 - y1, x2 - x1);
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    const snapped = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
+    return { x2: x1 + Math.cos(snapped) * len, y2: y1 + Math.sin(snapped) * len };
+  };
+
+  const beginLine = (e: React.PointerEvent) => {
+    const s = toWorld(e.clientX, e.clientY);
+    setSelectedAnnotationId(null);
+    setPendingLine({ x1: s.x, y1: s.y, x2: s.x, y2: s.y });
+    const onMove = (ev: PointerEvent) => {
+      const p = toWorld(ev.clientX, ev.clientY);
+      const { x2, y2 } = snapLineEnd(s.x, s.y, p.x, p.y, ev.shiftKey);
+      setPendingLine({ x1: s.x, y1: s.y, x2, y2 });
+    };
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      const p = toWorld(ev.clientX, ev.clientY);
+      const { x2, y2 } = snapLineEnd(s.x, s.y, p.x, p.y, ev.shiftKey);
+      setPendingLine(null);
+      if (Math.hypot(x2 - s.x, y2 - s.y) < 3) return;
+      pushHistory();
+      const ann: Annotation = { id: crypto.randomUUID(), type: 'line', x1: s.x, y1: s.y, x2, y2, color: draw.color, width: draw.lineWidth };
+      setAnnotations(prev => [...prev, ann]);
+      setSelectedAnnotationId(ann.id);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const placeText = (e: React.PointerEvent) => {
+    const p = toWorld(e.clientX, e.clientY);
+    pushHistory();
+    const ann: Annotation = { id: crypto.randomUUID(), type: 'text', x: p.x, y: p.y - draw.textSize / 2, text: '', color: draw.color, size: draw.textSize };
+    setAnnotations(prev => [...prev, ann]);
+    setSelectedAnnotationId(ann.id);
+    setEditingText(ann.id);
+    setTool('select');
+  };
+
+  const updateAnnotation = (id: string, patch: Partial<Annotation>) => {
+    setAnnotations(prev => prev.map(a => a.id === id ? ({ ...a, ...patch } as Annotation) : a));
+  };
+
+  const commitText = (id: string, text: string) => {
+    setEditingText(null);
+    if (!text.trim()) {
+      setAnnotations(prev => prev.filter(a => a.id !== id));
+      return;
+    }
+    updateAnnotation(id, { text } as Partial<Annotation>);
+  };
+
+  const deleteAnnotation = (id: string) => {
+    pushHistory();
+    setAnnotations(prev => prev.filter(a => a.id !== id));
+    if (selectedAnnotationId === id) setSelectedAnnotationId(null);
+  };
+
+  const beginAnnotationMove = (e: React.PointerEvent, ann: Annotation) => {
+    if (toolRef.current !== 'select') return;
+    e.stopPropagation();
+    setSelectedAnnotationId(ann.id);
+    setSelectedIds(new Set());
+    const startX = e.clientX, startY = e.clientY;
+    const startZoom = zoomRef.current;
+    const orig = { ...ann };
+    let didSnapshot = false;
+    const onMove = (ev: PointerEvent) => {
+      const dx = (ev.clientX - startX) / startZoom;
+      const dy = (ev.clientY - startY) / startZoom;
+      if (!didSnapshot && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) { pushHistory(); didSnapshot = true; }
+      if (orig.type === 'line') {
+        updateAnnotation(ann.id, { x1: orig.x1 + dx, y1: orig.y1 + dy, x2: orig.x2 + dx, y2: orig.y2 + dy } as Partial<Annotation>);
+      } else {
+        updateAnnotation(ann.id, { x: orig.x + dx, y: orig.y + dy } as Partial<Annotation>);
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
   // --- Hotkeys ---
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -614,9 +838,24 @@ export default function SmartStitchView() {
 
       if (e.key === 'Escape') {
         if (previewImage) setPreviewImage(null);
+        else if (editingText) setEditingText(null);
         else if (cropState) cancelCrop();
         else if (autoPreview) cancelAutoPreview();
-        else setSelectedIds(new Set());
+        else if (pendingLine) setPendingLine(null);
+        else if (tool !== 'select') setTool('select');
+        else { setSelectedIds(new Set()); setSelectedAnnotationId(null); }
+        return;
+      }
+      // Tool shortcuts (only in the plain editing state)
+      if (!mod && !cropState && !autoPreview) {
+        if (e.key === 'v' || e.key === 'V') { setTool('select'); return; }
+        if (e.key === 'b' || e.key === 'B') { setTool('brush'); return; }
+        if (e.key === 'l' || e.key === 'L') { setTool('line'); return; }
+        if (e.key === 't' || e.key === 'T') { setTool('text'); return; }
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedAnnotationId) {
+        e.preventDefault();
+        deleteAnnotation(selectedAnnotationId);
         return;
       }
       if (mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
@@ -684,7 +923,7 @@ export default function SmartStitchView() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage, cropState, frame]);
+  }, [selectedIds, canvasItems, autoPreview, settings, images, previewImage, cropState, frame, tool, editingText, pendingLine, selectedAnnotationId, annotations]);
 
   // --- Zoom helpers ---
   const zoomBy = (factor: number) => {
@@ -763,6 +1002,27 @@ export default function SmartStitchView() {
     await Promise.all(loaded.map(addImage));
     setImages(prev => [...prev, ...loaded]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+
+    // Auto-place new uploads on the canvas at native size, laid out in a row
+    // centered on the viewport, so they show up immediately (no empty state).
+    if (loaded.length > 0 && viewportRef.current) {
+      const gap = 60;
+      const totalW = loaded.reduce((s, i) => s + i.width, 0) + gap * (loaded.length - 1);
+      const r = viewportRef.current.getBoundingClientRect();
+      const center = toWorld(r.left + r.width / 2, r.top + r.height / 2);
+      let x = center.x - totalW / 2;
+      const newItems: CanvasItem[] = loaded.map(img => {
+        const item: CanvasItem = {
+          id: crypto.randomUUID(), type: 'image', imageId: img.id,
+          x, y: center.y - img.height / 2, width: img.width, height: img.height,
+        };
+        x += img.width + gap;
+        return item;
+      });
+      setCanvasItems(prev => [...prev, ...newItems]);
+      setSelectedIds(new Set(newItems.map(i => i.id)));
+      zoomToFit(bboxOf(newItems));
+    }
   };
   const handleDeleteImage = async (id: string) => {
     pushHistory();
@@ -928,10 +1188,17 @@ export default function SmartStitchView() {
       window.addEventListener('pointerup', onUp);
       return;
     }
+    // Drawing tools take over the surface (empty canvas)
+    if (e.button === 0 && !autoPreview && !cropState) {
+      if (tool === 'line') { e.preventDefault(); beginLine(e); return; }
+      if (tool === 'text') { e.preventDefault(); placeText(e); return; }
+      if (tool === 'brush') { return; } // brush only paints on an item
+    }
     // Marquee — only if target is viewport or world itself (not an item)
     if (!onSurface) return;
     if (e.button !== 0) return;
     if (autoPreview || cropState) return; // no selection change during preview/crop
+    if (tool !== 'select') { setSelectedIds(new Set()); setSelectedAnnotationId(null); return; }
 
     const start = toWorld(e.clientX, e.clientY);
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
@@ -964,6 +1231,10 @@ export default function SmartStitchView() {
     if (spaceRef.current || e.button === 1) return; // let viewport handle pan
     if (autoPreview) { e.stopPropagation(); return; } // lock during preview
     if (cropState) { e.stopPropagation(); return; } // lock during crop
+    // Tool routing: brush paints this item's mask; line/text draw at the point.
+    if (tool === 'brush' && (item.type !== 'stitch' || item.dataUrl)) { beginBrushStroke(e, item); return; }
+    if (tool === 'line') { e.stopPropagation(); e.preventDefault(); beginLine(e); return; }
+    if (tool === 'text') { e.stopPropagation(); e.preventDefault(); placeText(e); return; }
     e.stopPropagation();
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
 
@@ -1342,6 +1613,96 @@ export default function SmartStitchView() {
             </button>
           </div>
 
+          {/* Tool dock */}
+          {!autoPreview && !cropState && (
+            <div className="absolute top-1/2 -translate-y-1/2 left-4 z-30 pointer-events-auto">
+              <div className="bg-background border border-border rounded-2xl shadow-sm flex flex-col overflow-hidden">
+                {([
+                  { id: 'select' as Tool, icon: <MousePointer2 size={16} />, key: 'V', label: 'Select' },
+                  { id: 'brush' as Tool, icon: <Brush size={16} />, key: 'B', label: 'Blend brush' },
+                  { id: 'line' as Tool, icon: <PenLine size={16} />, key: 'L', label: 'Line' },
+                  { id: 'text' as Tool, icon: <TypeIcon size={16} />, key: 'T', label: 'Text' },
+                ]).map(t => (
+                  <button key={t.id} onClick={() => setTool(t.id)} title={`${t.label} (${t.key})`}
+                    className={`w-10 h-10 flex items-center justify-center transition-colors ${
+                      tool === t.id ? 'bg-accent text-white' : 'text-secondary hover:text-primary hover:bg-surface'}`}>
+                    {t.icon}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Tool settings */}
+          {!autoPreview && !cropState && tool !== 'select' && (
+            <div className="absolute bottom-4 left-4 z-30 pointer-events-auto bg-background border border-border rounded-2xl shadow-sm px-4 py-3 flex items-center gap-4 flex-wrap max-w-[calc(100%-2rem)]">
+              {tool === 'brush' ? (
+                <>
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-accent flex items-center gap-1.5"><Brush size={12} /> Blend</span>
+                  <label className="flex items-center gap-2">
+                    <span className="font-mono text-[9px] uppercase tracking-wider text-secondary">Size</span>
+                    <input type="range" min={10} max={800} step={5} value={brush.size}
+                      onChange={(e) => setBrush(b => ({ ...b, size: Number(e.target.value) }))} className="range-clean w-28" />
+                    <span className="font-mono text-[9px] text-secondary w-10 text-right">{brush.size}px</span>
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <span className="font-mono text-[9px] uppercase tracking-wider text-secondary">Feather</span>
+                    <input type="range" min={0} max={100} step={1} value={Math.round((1 - brush.hardness) * 100)}
+                      onChange={(e) => setBrush(b => ({ ...b, hardness: 1 - Number(e.target.value) / 100 }))} className="range-clean w-24" />
+                    <span className="font-mono text-[9px] text-secondary w-8 text-right">{Math.round((1 - brush.hardness) * 100)}%</span>
+                  </label>
+                  <div className="flex items-center border border-border rounded-full overflow-hidden">
+                    <button onClick={() => setBrush(b => ({ ...b, restore: false }))}
+                      className={`px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors ${!brush.restore ? 'bg-accent text-white' : 'text-secondary hover:text-primary'}`}>
+                      <Eraser size={11} /> Erase
+                    </button>
+                    <button onClick={() => setBrush(b => ({ ...b, restore: true }))}
+                      className={`px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors ${brush.restore ? 'bg-accent text-white' : 'text-secondary hover:text-primary'}`}>
+                      <Brush size={11} /> Restore
+                    </button>
+                  </div>
+                  {selectedIds.size === 1 && canvasItems.find(i => selectedIds.has(i.id))?.maskDataUrl && (
+                    <button onClick={() => clearMask([...selectedIds][0])}
+                      className="font-mono text-[9px] uppercase tracking-wider text-secondary hover:text-red-500 transition-colors">
+                      Reset mask
+                    </button>
+                  )}
+                  <span className="font-mono text-[9px] text-secondary hidden lg:inline">Paint an image edge to blend it into the one below.</span>
+                </>
+              ) : (
+                <>
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-accent flex items-center gap-1.5">
+                    {tool === 'line' ? <><PenLine size={12} /> Line</> : <><TypeIcon size={12} /> Text</>}
+                  </span>
+                  <label className="flex items-center gap-2">
+                    <span className="font-mono text-[9px] uppercase tracking-wider text-secondary">Color</span>
+                    <input type="color" value={draw.color}
+                      onChange={(e) => setDraw(d => ({ ...d, color: e.target.value }))}
+                      className="w-8 h-8 rounded cursor-pointer border border-border p-0 bg-surface" />
+                  </label>
+                  {tool === 'line' ? (
+                    <label className="flex items-center gap-2">
+                      <span className="font-mono text-[9px] uppercase tracking-wider text-secondary">Width</span>
+                      <input type="range" min={1} max={60} step={1} value={draw.lineWidth}
+                        onChange={(e) => setDraw(d => ({ ...d, lineWidth: Number(e.target.value) }))} className="range-clean w-28" />
+                      <span className="font-mono text-[9px] text-secondary w-8 text-right">{draw.lineWidth}</span>
+                    </label>
+                  ) : (
+                    <label className="flex items-center gap-2">
+                      <span className="font-mono text-[9px] uppercase tracking-wider text-secondary">Size</span>
+                      <input type="range" min={12} max={400} step={4} value={draw.textSize}
+                        onChange={(e) => setDraw(d => ({ ...d, textSize: Number(e.target.value) }))} className="range-clean w-28" />
+                      <span className="font-mono text-[9px] text-secondary w-10 text-right">{draw.textSize}px</span>
+                    </label>
+                  )}
+                  <span className="font-mono text-[9px] text-secondary hidden lg:inline">
+                    {tool === 'line' ? 'Drag to draw · Shift snaps to 45°' : 'Click to place text · double-click to edit'}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+
           {/* Viewport */}
           <div
             ref={viewportRef}
@@ -1358,9 +1719,9 @@ export default function SmartStitchView() {
                   <Upload size={26} className="text-secondary/50" />
                 </div>
                 <div className="text-center space-y-1">
-                  <h3 className="font-serif text-2xl text-primary">{activeThread?.name || 'Canvas'}</h3>
+                  <h3 className="font-serif text-2xl text-primary">{activeThread?.name || 'Character Sheet'}</h3>
                   <p className="font-mono text-[10px] uppercase tracking-widest text-secondary">
-                    Drag images from the library · double-click to drop at center
+                    Add images to drop them here · frame (F) to set the export size
                   </p>
                 </div>
               </div>
@@ -1391,11 +1752,22 @@ export default function SmartStitchView() {
                     style={{
                       left: item.x, top: item.y,
                       width: item.width, height: item.height,
-                      cursor: autoPreview ? 'default' : (isSelected ? 'move' : 'pointer'),
+                      cursor: autoPreview ? 'default'
+                        : tool === 'brush' ? 'crosshair'
+                        : tool === 'line' || tool === 'text' ? 'crosshair'
+                        : isSelected ? 'move' : 'pointer',
                     }}
                   >
                     {src ? (
-                      <img src={src} draggable={false} className="w-full h-full object-cover pointer-events-none block" alt="" />
+                      <ItemView
+                        src={src}
+                        maskDataUrl={item.maskDataUrl}
+                        masked={!!item.maskDataUrl || maskEditingItemId === item.id}
+                        itemId={item.id}
+                        maskDims={maskDims(item)}
+                        maskRegistry={maskCanvasRef.current}
+                        redrawRegistry={itemRedrawRef.current}
+                      />
                     ) : (
                       <div className="w-full h-full bg-surface flex items-center justify-center text-xs text-secondary">missing</div>
                     )}
@@ -1413,7 +1785,7 @@ export default function SmartStitchView() {
                         </button>
                       </div>
                     )}
-                    {isSelected && !autoPreview && !cropState && (
+                    {isSelected && !autoPreview && !cropState && tool === 'select' && (
                       <>
                         <ResizeHandle corner="tl" onPointerDown={(e) => handleResizePointerDown(e, item, 'tl')} />
                         <ResizeHandle corner="tr" onPointerDown={(e) => handleResizePointerDown(e, item, 'tr')} />
@@ -1500,6 +1872,65 @@ export default function SmartStitchView() {
                   />
                 </div>
               )}
+
+              {/* Annotations (lines + text) */}
+              {annotations.map(ann => {
+                const isSel = selectedAnnotationId === ann.id;
+                const interactive = tool === 'select' && !autoPreview && !cropState;
+                if (ann.type === 'line') {
+                  const dx = ann.x2 - ann.x1, dy = ann.y2 - ann.y1;
+                  const len = Math.hypot(dx, dy);
+                  const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+                  const hit = Math.max(ann.width, 12 / zoom);
+                  return (
+                    <div key={ann.id} className="absolute" style={{ left: ann.x1, top: ann.y1, width: len, height: hit,
+                      transform: `translateY(${-hit / 2}px) rotate(${angle}deg)`, transformOrigin: '0 50%',
+                      pointerEvents: interactive ? 'auto' : 'none', cursor: interactive ? 'move' : 'default' }}
+                      onPointerDown={(e) => interactive && beginAnnotationMove(e, ann)}>
+                      <div className="absolute left-0 right-0" style={{
+                        top: '50%', height: ann.width, transform: 'translateY(-50%)',
+                        background: ann.color, borderRadius: ann.width / 2,
+                        outline: isSel ? `${2 / zoom}px solid rgba(242,97,87,0.7)` : 'none', outlineOffset: `${2 / zoom}px` }} />
+                    </div>
+                  );
+                }
+                return (
+                  <div key={ann.id} className="absolute" style={{ left: ann.x, top: ann.y,
+                    pointerEvents: interactive ? 'auto' : 'none', cursor: interactive ? 'move' : 'default' }}
+                    onPointerDown={(e) => interactive && editingText !== ann.id && beginAnnotationMove(e, ann)}
+                    onDoubleClick={(e) => { if (interactive) { e.stopPropagation(); setEditingText(ann.id); setSelectedAnnotationId(ann.id); } }}>
+                    {editingText === ann.id ? (
+                      <textarea autoFocus value={ann.text}
+                        onChange={(e) => updateAnnotation(ann.id, { text: e.target.value } as Partial<Annotation>)}
+                        onBlur={(e) => commitText(ann.id, e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitText(ann.id, (e.target as HTMLTextAreaElement).value); } }}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        rows={1}
+                        style={{ font: `${ann.size}px/1.1 ui-sans-serif, system-ui, sans-serif`, color: ann.color,
+                          background: 'rgba(0,0,0,0.06)', outline: `${2 / zoom}px solid var(--color-accent,#F26157)`,
+                          border: 'none', padding: 0, margin: 0, resize: 'none', overflow: 'hidden',
+                          whiteSpace: 'pre', width: `${Math.max(ann.text.length, 4)}ch` }} />
+                    ) : (
+                      <div style={{ font: `${ann.size}px/1.1 ui-sans-serif, system-ui, sans-serif`, color: ann.color,
+                        whiteSpace: 'pre', outline: isSel ? `${2 / zoom}px solid rgba(242,97,87,0.7)` : 'none' }}>
+                        {ann.text || ' '}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* In-progress line */}
+              {pendingLine && (() => {
+                const dx = pendingLine.x2 - pendingLine.x1, dy = pendingLine.y2 - pendingLine.y1;
+                const len = Math.hypot(dx, dy);
+                const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+                return (
+                  <div className="absolute pointer-events-none" style={{ left: pendingLine.x1, top: pendingLine.y1,
+                    width: len, height: draw.lineWidth, transform: `translateY(${-draw.lineWidth / 2}px) rotate(${angle}deg)`,
+                    transformOrigin: '0 50%', background: draw.color, borderRadius: draw.lineWidth / 2, opacity: 0.8 }} />
+                );
+              })()}
 
               {/* Marquee */}
               {marquee && (
@@ -1743,6 +2174,87 @@ export default function SmartStitchView() {
 }
 
 // --- Helpers ---
+
+/**
+ * Renders a canvas item. Plain <img> when unmasked; a <canvas> compositing
+ * image (cover-fit) + live layer mask when masked/being brushed. The mask
+ * canvas lives in a shared registry so brush strokes mutate it directly and
+ * this view just recomposites — no per-stroke serialization.
+ */
+const ItemView: React.FC<{
+  src: string;
+  maskDataUrl?: string;
+  masked: boolean;
+  itemId: string;
+  maskDims: { w: number; h: number };
+  maskRegistry: Map<string, HTMLCanvasElement>;
+  redrawRegistry: Map<string, () => void>;
+}> = ({ src, maskDataUrl, masked, itemId, maskDims, maskRegistry, redrawRegistry }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    if (!masked) return;
+    let cancelled = false;
+    const { w, h } = maskDims;
+
+    const redraw = () => {
+      const cv = canvasRef.current, im = imgRef.current;
+      if (!cv || !im) return;
+      if (cv.width !== w) cv.width = w;
+      if (cv.height !== h) cv.height = h;
+      const ctx = cv.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0, 0, w, h);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      const scale = Math.max(w / im.width, h / im.height);
+      const dw = im.width * scale, dh = im.height * scale;
+      ctx.drawImage(im, (w - dw) / 2, (h - dh) / 2, dw, dh);
+      const mask = maskRegistry.get(itemId);
+      if (mask) {
+        ctx.globalCompositeOperation = 'destination-in';
+        ctx.drawImage(mask, 0, 0, w, h);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+    };
+    redrawRegistry.set(itemId, redraw);
+
+    (async () => {
+      if (!imgRef.current || imgRef.current.getAttribute('data-src') !== src) {
+        const im = await loadImage(src);
+        if (cancelled) return;
+        im.setAttribute('data-src', src);
+        imgRef.current = im;
+      }
+      // Only hydrate a mask canvas if none is registered yet (else trust the live one).
+      if (!maskRegistry.get(itemId)) {
+        const mc = document.createElement('canvas');
+        mc.width = w; mc.height = h;
+        const mctx = mc.getContext('2d')!;
+        if (maskDataUrl) {
+          const mimg = await loadImage(maskDataUrl);
+          if (cancelled) return;
+          mctx.clearRect(0, 0, w, h);
+          mctx.drawImage(mimg, 0, 0, w, h);
+        } else {
+          mctx.fillStyle = '#fff';
+          mctx.fillRect(0, 0, w, h);
+        }
+        maskRegistry.set(itemId, mc);
+      }
+      redraw();
+    })();
+
+    return () => { cancelled = true; redrawRegistry.delete(itemId); };
+  }, [src, masked, maskDataUrl, maskDims.w, maskDims.h, itemId, maskRegistry, redrawRegistry]);
+
+  if (!masked) {
+    return <img src={src} draggable={false} className="w-full h-full object-cover pointer-events-none block" alt="" />;
+  }
+  return <canvas ref={canvasRef} className="w-full h-full block pointer-events-none" />;
+};
+
 const ResizeHandle: React.FC<{ corner: 'tl' | 'tr' | 'bl' | 'br'; onPointerDown: (e: React.PointerEvent) => void }> = ({ corner, onPointerDown }) => {
   const pos: Record<string, string> = {
     tl: '-top-1.5 -left-1.5 cursor-nwse-resize',

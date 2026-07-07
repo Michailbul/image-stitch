@@ -41,7 +41,8 @@ import {
   CopyPlus,
   Minimize2,
   Camera as CameraIcon,
-  Clapperboard
+  Clapperboard,
+  SquareUser
 } from 'lucide-react';
 
 function App({ embedded = false }: { embedded?: boolean } = {}) {
@@ -677,8 +678,8 @@ function App({ embedded = false }: { embedded?: boolean } = {}) {
           <NavButton
             active={activeTab === 'smartStitch'}
             onClick={() => setActiveTab('smartStitch')}
-            icon={<Layers size={22} strokeWidth={1.5} />}
-            label="Auto Stitch"
+            icon={<SquareUser size={22} strokeWidth={1.5} />}
+            label="Character Sheet Stitch"
           />
           <NavButton
             active={activeTab === 'storyboard'}

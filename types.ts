@@ -86,11 +86,31 @@ export interface CanvasItem {
   stitchMode?: 'auto' | 'manual';
   nativeWidth?: number;      // source pixel dims for 'stitch' items (quality math)
   nativeHeight?: number;
+  /** Layer mask (alpha): opaque = visible, transparent = erased. Stretched to the item box. */
+  maskDataUrl?: string;
   x: number;
   y: number;
   width: number;
   height: number;
 }
+
+/** Vector overlay drawn on the canvas in world coordinates (output pixels). */
+export type Annotation =
+  | {
+      id: string;
+      type: 'line';
+      x1: number; y1: number; x2: number; y2: number;
+      color: string;
+      width: number; // world units
+    }
+  | {
+      id: string;
+      type: 'text';
+      x: number; y: number; // top-left anchor
+      text: string;
+      color: string;
+      size: number; // world units (px in output)
+    };
 
 /**
  * Fixed-aspect export frame on the canvas. Height is derived:
@@ -121,6 +141,7 @@ export interface Thread {
   canvasItems: CanvasItem[];
   settings: StitchSettings;
   frame?: FrameSpec | null;
+  annotations?: Annotation[];
 }
 
 // --- Camera Language Library ---
