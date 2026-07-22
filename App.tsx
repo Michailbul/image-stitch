@@ -6,6 +6,7 @@ import ColorExplorerView from './views/ColorExplorerView';
 import CameraLanguageView from './views/CameraLanguageView';
 import ResizeView from './views/ResizeView';
 import StoryboardView from './views/StoryboardView';
+import LayerStudioView from './views/LayerStudioView';
 import { generateStitchedCanvas, cropImage, generateCompositeImage } from './utils/imageUtils';
 import { ImageLayer, StitchItem, AssetGroup, CropRegion } from './types';
 import {
@@ -46,7 +47,7 @@ import {
 } from 'lucide-react';
 
 function App({ embedded = false }: { embedded?: boolean } = {}) {
-  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'storyboard' | 'resize' | 'colors' | 'camera'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'stitch' | 'smartStitch' | 'storyboard' | 'layerStudio' | 'resize' | 'colors' | 'camera'>('editor');
   
   // Selection & Navigation
   const [activeAssetId, setActiveAssetId] = useState<string | null>(null); // Can be LayerID or GroupID
@@ -688,6 +689,12 @@ function App({ embedded = false }: { embedded?: boolean } = {}) {
             label="Storyboard"
           />
           <NavButton
+            active={activeTab === 'layerStudio'}
+            onClick={() => setActiveTab('layerStudio')}
+            icon={<Layers size={22} strokeWidth={1.5} />}
+            label="Layer Studio"
+          />
+          <NavButton
             active={activeTab === 'colors'}
             onClick={() => setActiveTab('colors')}
             icon={<Palette size={22} strokeWidth={1.5} />}
@@ -798,6 +805,8 @@ function App({ embedded = false }: { embedded?: boolean } = {}) {
              <SmartStitchView />
            ) : activeTab === 'storyboard' ? (
              <StoryboardView />
+           ) : activeTab === 'layerStudio' ? (
+             <LayerStudioView />
            ) : activeTab === 'resize' ? (
              <ResizeView />
            ) : activeTab === 'camera' ? (

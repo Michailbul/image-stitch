@@ -1045,6 +1045,10 @@ export default function SmartStitchView() {
   const handleCanvasDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    // This drop stops propagation, so the root drop handler that normally hides
+    // the "Drop to add to library" overlay won't fire — clear it here too.
+    dropCounterRef.current = 0;
+    setIsDroppingFile(false);
     const files = e.dataTransfer.files && e.dataTransfer.files.length > 0
       ? (Array.from(e.dataTransfer.files) as File[]).filter((f) => f.type.startsWith('image/'))
       : [];
