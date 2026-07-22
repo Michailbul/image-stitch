@@ -1,0 +1,1915 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { sam3Segment, fluxFill, getFalKey, setFalKey, hasFalKey } from '../utils/fal';
+import { saveProject, loadProject, PersistedProject, PersistedTab } from '../utils/layerStudioStore';
+import {
+  Upload,
+  Move,
+  Brush,
+  Hand,
+  Eye,
+  EyeOff,
+  Trash2,
+  Download,
+  ArrowUp,
+  ArrowDown,
+  Eraser,
+  Paintbrush,
+  Maximize,
+  RotateCw,
+  Layers as LayersIcon,
+  Frame,
+  Pipette,
+  Undo2,
+  Redo2,
+  Wand2,
+  Loader2,
+  KeyRound,
+  X,
+  LayoutGrid,
+  Plus,
+  ImagePlus,
+  Crop,
+  Sparkles,
+} from 'lucide-react';
+
+// --- Config ---
+const DOC_LONG = 2048;         // artboard long-edge working resolution (px)
+const EXPORT_LONG_EDGE = 2048; // 2K export long edge
+const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
+
+const ASPECTS: { label: string; w: number; h: number }[] = [
+  { label: '16:9', w: 16, h: 9 },
+  { label: '9:16', w: 9, h: 16 },
+  { label: '1:1', w: 1, h: 1 },
+  { label: '4:3', w: 4, h: 3 },
+  { label: '3:4', w: 3, h: 4 },
+  { label: '4:5', w: 4, h: 5 },
+  { label: '3:2', w: 3, h: 2 },
+  { label: '2:3', w: 2, h: 3 },
+  { label: '2:1', w: 2, h: 1 },
+];
+
+const BG_SWATCHES: { label: string; value: string | null }[] = [
+  { label: 'Grey', value: DEFAULT_BG },
+  { label: 'White', value: '#ffffff' },
+  { label: 'Black', value: '#0a0a0a' },
+  { label: 'None', value: null },
+];
+
+/** Artboard pixel dims for a given aspect ratio (long edge = DOC_LONG). */
+const dimsForAspect = (aw: number, ah: number) =>
+  aw >= ah
+    ? { w: DOC_LONG, h: Math.round((DOC_LONG * ah) / aw) }
+    : { w: Math.round((DOC_LONG * aw) / ah), h: DOC_LONG };
+
+type Tool = 'move' | 'mask' | 'hand' | 'eyedropper' | 'select' | 'crop';
+type MaskMode = 'hide' | 'reveal';
+
+const MAX_ZOOM = 16;      // hard upper bound
+const MIN_ZOOM_FIT = 0.5; // can't zoom out below this fraction of the fit scale
+const PAN_MARGIN = 140;   // px of empty space allowed beyond the artboard edges
+
+/** Undo/redo snapshot of the whole editable state. Masks are stored as data URLs. */
+interface Snapshot {
+  layers: CompLayer[];
+  masks: Record<string, string>;
+  bgColor: string | null;
+  aw: number; ah: number;
+  docW: number; docH: number;
+  activeId: string | null;
+}
+
+interface CompLayer {
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;   // 0..1
+  x: number;         // top-left in doc space
+  y: number;
+  scale: number;     // multiplier on the source image's natural size
+  rotation: number;  // degrees
+  assetId: string;   // references a shared project asset
+}
+
+interface ProjectAsset { id: string; name: string; w: number; h: number; }
+
+let uid = 0;
+const nextId = () => `L${Date.now().toString(36)}-${uid++}`;
+const newUUID = () => (crypto?.randomUUID ? crypto.randomUUID() : `id-${Date.now().toString(36)}-${uid++}`);
+
+const LayerStudioView: React.FC = () => {
+  // --- Document / artboard ---
+  const initial = dimsForAspect(16, 9);
+  const [docW, setDocW] = useState(initial.w);
+  const [docH, setDocH] = useState(initial.h);
+  const [aspect, setAspect] = useState<{ w: number; h: number }>({ w: 16, h: 9 });
+  const [bgColor, setBgColor] = useState<string | null>(DEFAULT_BG);
+  const [showBounds, setShowBounds] = useState(true);
+  const bgColorRef = useRef<string | null>(DEFAULT_BG);
+  bgColorRef.current = bgColor;
+  const showBoundsRef = useRef(true);
+  showBoundsRef.current = showBounds;
+
+  // --- Layers (metadata only; pixels live in refs) ---
+  const [layers, setLayers] = useState<CompLayer[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  // Non-reactive pixel stores for the ACTIVE tab (keyed by layer id).
+  const imagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const masksRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+
+  // --- Project: shared assets + tabs ---
+  // Assets are uploaded once and shared across every tab in the project.
+  const assetsRef = useRef<Map<string, { name: string; w: number; h: number; img: HTMLImageElement; dataUrl: string }>>(new Map());
+  const [assets, setAssets] = useState<ProjectAsset[]>([]);
+  const [tabsMeta, setTabsMeta] = useState<{ id: string; name: string }[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const tabsMetaRef = useRef(tabsMeta);
+  tabsMetaRef.current = tabsMeta;
+  const activeTabIdRef = useRef<string | null>(null);
+  activeTabIdRef.current = activeTabId;
+  // Serialized docs for tabs (inactive tabs live here; the active tab's live
+  // state is authoritative and flushed here on save/switch).
+  const tabDocsRef = useRef<Map<string, PersistedTab>>(new Map());
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+
+  // --- Tools ---
+  const [tool, setTool] = useState<Tool>('move');
+  const [maskMode, setMaskMode] = useState<MaskMode>('hide');
+  const [brushSize, setBrushSize] = useState(120);
+  const [brushHardness, setBrushHardness] = useState(0.5); // 0 soft .. 1 hard
+  const [brushFlow, setBrushFlow] = useState(0.85);
+  const [brushFeather, setBrushFeather] = useState(0);     // px, edge blur baked per-stroke
+  const brushFeatherRef = useRef(0);
+  brushFeatherRef.current = brushFeather;
+
+  // --- Smart Select (SAM 3 via fal) ---
+  const [selectPrompt, setSelectPrompt] = useState('');
+  const [selecting, setSelecting] = useState(false);
+  const [selectMsg, setSelectMsg] = useState<string | null>(null);
+  const [busyMsg, setBusyMsg] = useState<string | null>(null); // multi-step AI preset overlay
+  const [keyModalOpen, setKeyModalOpen] = useState(false);
+  const [keyInput, setKeyInput] = useState('');
+
+  // --- View transform ---
+  const viewScaleRef = useRef(1);
+  const viewOffRef = useRef({ x: 0, y: 0 }); // screen px offset of doc origin
+
+  // --- Canvas refs ---
+  const viewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const docCanvasRef = useRef<HTMLCanvasElement>(null); // offscreen composite @ doc res
+  const containerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Interaction state
+  const dragRef = useRef<{ mode: 'none' | 'move' | 'pan' | 'paint' | 'crop'; sx: number; sy: number; ox: number; oy: number } | null>(null);
+  const lastPaintRef = useRef<{ x: number; y: number } | null>(null);
+  // Crop marquee (doc-space rect) while dragging with the crop tool.
+  const cropRectRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  // In-progress mask stroke: accumulated on its own buffer so its feather is
+  // baked only into this stroke, never re-blurring previously painted areas.
+  const strokeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const strokeInfoRef = useRef<{ layerId: string; mode: MaskMode; feather: number } | null>(null);
+  const cursorRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number | null>(null);
+  const [, force] = useState(0);
+  const rerender = () => force(n => n + 1);
+
+  const layersRef = useRef(layers);
+  layersRef.current = layers;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  const toolRef = useRef(tool);
+  toolRef.current = tool;
+  const aspectRef = useRef(aspect);
+  aspectRef.current = aspect;
+
+  // Space-to-pan (temporary hand from any tool) + undo/redo history.
+  const spaceRef = useRef(false);
+  const movePushedRef = useRef(false);
+  const histRef = useRef<Snapshot[]>([]);
+  const redoRef = useRef<Snapshot[]>([]);
+  const [, setHistVer] = useState(0);
+  const bumpHist = () => setHistVer(v => v + 1);
+  const [zoomPct, setZoomPct] = useState(100);
+  const syncZoom = () => setZoomPct(prev => {
+    const p = Math.round(viewScaleRef.current * 100);
+    return prev === p ? prev : p;
+  });
+
+  // Persistence: hydrating guard (don't autosave over saved data during load)
+  // and a debounced save timer.
+  const hydratingRef = useRef(true);
+  const saveTimerRef = useRef<number | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Import
+  // ---------------------------------------------------------------------------
+  const loadImage = (file: File): Promise<HTMLImageElement | null> =>
+    new Promise(resolve => {
+      if (!file.type.startsWith('image/')) return resolve(null);
+      const reader = new FileReader();
+      reader.onload = e => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+
+  // Build a fresh, fully-opaque (visible) mask at the current doc size.
+  const blankMask = (dw: number, dh: number) => {
+    const mask = document.createElement('canvas');
+    mask.width = dw; mask.height = dh;
+    const mctx = mask.getContext('2d')!;
+    mctx.fillStyle = '#fff';
+    mctx.fillRect(0, 0, dw, dh);
+    return mask;
+  };
+
+  /** Place an existing project asset as a new layer on the active tab. */
+  const addLayerFromAsset = (assetId: string, activate = true) => {
+    const asset = assetsRef.current.get(assetId);
+    if (!asset) return null;
+    const dw = docWRef.current, dh = docHRef.current;
+    const id = nextId();
+    imagesRef.current.set(id, asset.img);
+    masksRef.current.set(id, blankMask(dw, dh));
+    const fit = Math.min(dw / asset.w, dh / asset.h);
+    const w = asset.w * fit, h = asset.h * fit;
+    const layer: CompLayer = {
+      id, name: asset.name, visible: true, opacity: 1,
+      x: (dw - w) / 2, y: (dh - h) / 2, scale: fit, rotation: 0, assetId,
+    };
+    setLayers(prev => [...prev, layer]);
+    if (activate) setActiveId(id);
+    return layer;
+  };
+
+  const importFiles = useCallback(async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    const loaded = await Promise.all(list.map(async f => ({ file: f, img: await loadImage(f) })));
+    const valid = loaded.filter(l => l.img) as { file: File; img: HTMLImageElement }[];
+    if (!valid.length) return;
+    const dw = docWRef.current, dh = docHRef.current;
+    pushHistory();
+
+    const newAssets: ProjectAsset[] = [];
+    const newLayers: CompLayer[] = [];
+    let lastId: string | null = null;
+    for (const { file, img } of valid) {
+      // Register a shared project asset (stored once, reusable in any tab).
+      const assetId = newUUID();
+      const name = (file.name.replace(/\.[^.]+$/, '') || 'Image').slice(0, 28);
+      assetsRef.current.set(assetId, { name, w: img.naturalWidth, h: img.naturalHeight, img, dataUrl: img.src });
+      newAssets.push({ id: assetId, name, w: img.naturalWidth, h: img.naturalHeight });
+
+      const id = nextId();
+      imagesRef.current.set(id, img);
+      masksRef.current.set(id, blankMask(dw, dh));
+      const fit = Math.min(dw / img.naturalWidth, dh / img.naturalHeight);
+      const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+      newLayers.push({
+        id, name, visible: true, opacity: 1,
+        x: (dw - w) / 2, y: (dh - h) / 2, scale: fit, rotation: 0, assetId,
+      });
+      lastId = id;
+    }
+    setAssets(prev => [...prev, ...newAssets]);
+    setLayers(prev => [...prev, ...newLayers]);
+    if (lastId) setActiveId(lastId);
+    setTimeout(() => { fitView(dw, dh); redrawAll(); }, 0);
+  }, []);
+
+  const docWRef = useRef(initial.w);
+  const docHRef = useRef(initial.h);
+  useEffect(() => { docWRef.current = docW; }, [docW]);
+  useEffect(() => { docHRef.current = docH; }, [docH]);
+
+  // Fit the artboard into view on mount, and re-fit until the container has a
+  // real size (flex layout may not be settled when the effect first runs).
+  const didFitRef = useRef(false);
+  useEffect(() => {
+    const tryFit = () => {
+      const cont = containerRef.current;
+      if (!cont || cont.clientWidth < 2) return false;
+      fitView(); redrawAll();
+      didFitRef.current = true;
+      return true;
+    };
+    if (!tryFit()) requestAnimationFrame(tryFit);
+    const ro = new ResizeObserver(() => {
+      if (!didFitRef.current) tryFit();
+      else drawView();
+    });
+    if (containerRef.current) ro.observe(containerRef.current);
+    return () => ro.disconnect();
+    /* eslint-disable-next-line */
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Artboard resolution / aspect
+  // ---------------------------------------------------------------------------
+  const applyAspect = (aw: number, ah: number) => {
+    const { w: nw, h: nh } = dimsForAspect(aw, ah);
+    const ow = docWRef.current, oh = docHRef.current;
+    if (nw === ow && nh === oh) { setAspect({ w: aw, h: ah }); return; }
+    pushHistory();
+    // Rebuild each layer's mask at the new size, preserving painted content by
+    // stretching the old mask into the new canvas.
+    masksRef.current.forEach((old, id) => {
+      const next = document.createElement('canvas');
+      next.width = nw; next.height = nh;
+      const nctx = next.getContext('2d')!;
+      nctx.drawImage(old, 0, 0, nw, nh);
+      masksRef.current.set(id, next);
+    });
+    // Re-scale layer positions proportionally so nothing jumps off-canvas.
+    const rx = nw / ow, ry = nh / oh;
+    setLayers(prev => prev.map(l => {
+      const img = imagesRef.current.get(l.id);
+      if (!img) return l;
+      const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
+      const cx = (l.x + w / 2) * rx, cy = (l.y + h / 2) * ry;
+      const ns = l.scale * Math.min(rx, ry);
+      const nwd = img.naturalWidth * ns, nhd = img.naturalHeight * ns;
+      return { ...l, scale: ns, x: cx - nwd / 2, y: cy - nhd / 2 };
+    }));
+    docWRef.current = nw; docHRef.current = nh;
+    setDocW(nw); setDocH(nh);
+    setAspect({ w: aw, h: ah });
+    setTimeout(() => { fitView(nw, nh); redrawAll(); }, 0);
+  };
+
+  // ---------------------------------------------------------------------------
+  // View math
+  // ---------------------------------------------------------------------------
+  /** Scale at which the artboard fits the viewport with padding. */
+  const fitScaleValue = (dw = docWRef.current, dh = docHRef.current) => {
+    const cont = containerRef.current;
+    if (!cont || !dw || !dh) return 1;
+    const pad = 64;
+    return Math.min((cont.clientWidth - pad) / dw, (cont.clientHeight - pad) / dh, 1.5);
+  };
+
+  const fitView = (dw = docWRef.current, dh = docHRef.current) => {
+    const cont = containerRef.current;
+    if (!cont || !dw || !dh) return;
+    const scale = fitScaleValue(dw, dh);
+    viewScaleRef.current = scale;
+    viewOffRef.current = {
+      x: (cont.clientWidth - dw * scale) / 2,
+      y: (cont.clientHeight - dh * scale) / 2,
+    };
+    syncZoom();
+  };
+
+  /**
+   * Keep the camera bounded: clamp zoom to [fit*MIN_ZOOM_FIT, MAX_ZOOM] and keep
+   * the artboard from being panned entirely out of view (a fixed margin of empty
+   * space is allowed on each side). This is the "locked canvas" behavior.
+   */
+  const clampView = () => {
+    const cont = containerRef.current;
+    if (!cont) return;
+    const W = cont.clientWidth, H = cont.clientHeight;
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh) return;
+    const minZoom = Math.min(fitScaleValue(dw, dh) * MIN_ZOOM_FIT, MAX_ZOOM);
+    const s = Math.max(minZoom, Math.min(MAX_ZOOM, viewScaleRef.current));
+    viewScaleRef.current = s;
+    const bw = dw * s, bh = dh * s;
+    const axis = (off: number, box: number, ext: number) => {
+      if (box + 2 * PAN_MARGIN <= ext) return (ext - box) / 2; // fits → center
+      return Math.max(ext - box - PAN_MARGIN, Math.min(PAN_MARGIN, off)); // clamp to edges
+    };
+    viewOffRef.current = {
+      x: axis(viewOffRef.current.x, bw, W),
+      y: axis(viewOffRef.current.y, bh, H),
+    };
+    syncZoom();
+  };
+
+  const screenToDoc = (clientX: number, clientY: number) => {
+    const cv = viewCanvasRef.current!;
+    const rect = cv.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    const s = viewScaleRef.current;
+    const off = viewOffRef.current;
+    return { x: (sx - off.x) / s, y: (sy - off.y) / s };
+  };
+
+  // ---------------------------------------------------------------------------
+  // Compositing
+  // ---------------------------------------------------------------------------
+  /**
+   * The mask actually used to render a layer. Feather is already baked into the
+   * stored mask per-stroke, so no global blur here. If a stroke is mid-flight on
+   * this layer, merge its (feathered) preview so the canvas updates live.
+   */
+  const effectiveMaskFor = (layer: CompLayer): HTMLCanvasElement | undefined => {
+    const base = masksRef.current.get(layer.id);
+    if (!base) return undefined;
+    const stroke = strokeCanvasRef.current;
+    const info = strokeInfoRef.current;
+    if (!stroke || !info || info.layerId !== layer.id) return base;
+    const m = document.createElement('canvas');
+    m.width = base.width; m.height = base.height;
+    const mc = m.getContext('2d')!;
+    mc.drawImage(base, 0, 0);
+    mc.globalCompositeOperation = info.mode === 'hide' ? 'destination-out' : 'source-over';
+    if (info.feather > 0) mc.filter = `blur(${info.feather}px)`;
+    mc.drawImage(stroke, 0, 0);
+    return m;
+  };
+
+  /** Draw the full document composite into ctx at pixel scale k (1 = doc res). */
+  const compositeInto = (ctx: CanvasRenderingContext2D, k: number) => {
+    const dw = docWRef.current, dh = docHRef.current;
+    const ls = layersRef.current;
+    ctx.clearRect(0, 0, dw * k, dh * k);
+    // Background fill (neutral grey by default; null = transparent).
+    const bg = bgColorRef.current;
+    if (bg) {
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, dw * k, dh * k);
+    }
+    for (const layer of ls) {
+      if (!layer.visible || layer.opacity <= 0) continue;
+      const img = imagesRef.current.get(layer.id);
+      const mask = effectiveMaskFor(layer);
+      if (!img || !mask) continue;
+
+      const lc = document.createElement('canvas');
+      lc.width = Math.max(1, Math.round(dw * k));
+      lc.height = Math.max(1, Math.round(dh * k));
+      const lctx = lc.getContext('2d')!;
+
+      const w = img.naturalWidth * layer.scale;
+      const h = img.naturalHeight * layer.scale;
+      const cx = (layer.x + w / 2) * k;
+      const cy = (layer.y + h / 2) * k;
+      lctx.save();
+      lctx.translate(cx, cy);
+      lctx.rotate((layer.rotation * Math.PI) / 180);
+      lctx.imageSmoothingQuality = 'high';
+      lctx.drawImage(img, (-w / 2) * k, (-h / 2) * k, w * k, h * k);
+      lctx.restore();
+
+      // Apply mask (alpha). Feather is already baked into the mask per-stroke.
+      lctx.globalCompositeOperation = 'destination-in';
+      lctx.drawImage(mask, 0, 0, dw * k, dh * k);
+      lctx.globalCompositeOperation = 'source-over';
+
+      ctx.globalAlpha = layer.opacity;
+      ctx.drawImage(lc, 0, 0);
+      ctx.globalAlpha = 1;
+    }
+  };
+
+  const redrawDoc = () => {
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh) return;
+    let dc = docCanvasRef.current;
+    if (!dc) { dc = document.createElement('canvas'); docCanvasRef.current = dc; }
+    if (dc.width !== dw || dc.height !== dh) { dc.width = dw; dc.height = dh; }
+    const ctx = dc.getContext('2d')!;
+    compositeInto(ctx, 1);
+  };
+
+  const drawView = () => {
+    const cv = viewCanvasRef.current;
+    const cont = containerRef.current;
+    if (!cv || !cont) return;
+    const W = cont.clientWidth, H = cont.clientHeight;
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    const ctx = cv.getContext('2d')!;
+    ctx.clearRect(0, 0, W, H);
+
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh) return;
+    const s = viewScaleRef.current;
+    const off = viewOffRef.current;
+
+    const bw = dw * s, bh = dh * s;
+
+    // Drop shadow so the artboard reads as a physical surface over the stage.
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.45)';
+    ctx.shadowBlur = 28;
+    ctx.shadowOffsetY = 10;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(off.x, off.y, bw, bh);
+    ctx.restore();
+
+    // Checkerboard (only visible where the artboard is transparent).
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(off.x, off.y, bw, bh);
+    ctx.clip();
+    const cell = 12;
+    for (let y = 0; y < bh; y += cell) {
+      for (let x = 0; x < bw; x += cell) {
+        const dark = ((x / cell) + (y / cell)) % 2 < 1;
+        ctx.fillStyle = dark ? 'rgba(140,140,150,0.28)' : 'rgba(90,90,100,0.16)';
+        ctx.fillRect(off.x + x, off.y + y, cell, cell);
+      }
+    }
+    ctx.restore();
+
+    // Composite.
+    const dc = docCanvasRef.current;
+    if (dc) {
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(dc, off.x, off.y, bw, bh);
+    }
+
+    // Artboard border — clearly visible when enabled.
+    if (showBounds) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(off.x - 0.5, off.y - 0.5, bw + 1, bh + 1);
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      ctx.strokeRect(off.x - 1.5, off.y - 1.5, bw + 3, bh + 3);
+    }
+
+    // Active layer bounds.
+    const active = layersRef.current.find(l => l.id === activeIdRef.current);
+    if (active && tool === 'move') {
+      const img = imagesRef.current.get(active.id);
+      if (img) {
+        const w = img.naturalWidth * active.scale;
+        const h = img.naturalHeight * active.scale;
+        const cx = off.x + (active.x + w / 2) * s;
+        const cy = off.y + (active.y + h / 2) * s;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate((active.rotation * Math.PI) / 180);
+        ctx.strokeStyle = '#FF552E';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect((-w / 2) * s, (-h / 2) * s, w * s, h * s);
+        ctx.restore();
+      }
+    }
+
+    // Crop marquee (while dragging with the crop tool): dim outside, dashed box.
+    const cr = cropRectRef.current;
+    if (tool === 'crop' && cr) {
+      const rx = off.x + Math.min(cr.x0, cr.x1) * s;
+      const ry = off.y + Math.min(cr.y0, cr.y1) * s;
+      const rw = Math.abs(cr.x1 - cr.x0) * s;
+      const rh = Math.abs(cr.y1 - cr.y0) * s;
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.beginPath();
+      ctx.rect(off.x, off.y, bw, bh);
+      ctx.rect(rx, ry, rw, rh);
+      ctx.fill('evenodd');
+      ctx.strokeStyle = '#FF552E';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(rx, ry, rw, rh);
+      ctx.restore();
+    }
+  };
+
+  const redrawAll = () => { redrawDoc(); drawView(); };
+  const scheduleRedraw = () => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      redrawAll();
+    });
+  };
+
+  // Redraw when layer metadata or artboard settings change.
+  useEffect(() => { redrawAll(); }, [layers, tool, showBounds, bgColor, docW, docH]);
+
+  // Resize handling.
+  useEffect(() => {
+    const onResize = () => { drawView(); };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Painting
+  // ---------------------------------------------------------------------------
+  const stampBrush = (mctx: CanvasRenderingContext2D, x: number, y: number) => {
+    const r = brushSize / 2;
+    // Inner (full-alpha) radius. Clamp below r: identical inner/outer radii make
+    // createRadialGradient paint nothing, which would break a fully-hard brush.
+    const inner = r * Math.min(brushHardness, 0.98);
+    const grad = mctx.createRadialGradient(x, y, inner, x, y, r);
+    const a = brushFlow;
+    grad.addColorStop(0, `rgba(255,255,255,${a})`);
+    grad.addColorStop(1, `rgba(255,255,255,0)`);
+    mctx.fillStyle = grad;
+    mctx.beginPath();
+    mctx.arc(x, y, r, 0, Math.PI * 2);
+    mctx.fill();
+  };
+
+  const paintAt = (docX: number, docY: number) => {
+    // Stamps accumulate on the stroke buffer (solid white); feather is applied
+    // once when the stroke is committed, so the interior stays solid and only
+    // this stroke's edge is softened — earlier strokes are untouched.
+    const stroke = strokeCanvasRef.current;
+    if (!stroke) return;
+    const sctx = stroke.getContext('2d')!;
+
+    const last = lastPaintRef.current;
+    if (last) {
+      const dx = docX - last.x, dy = docY - last.y;
+      const dist = Math.hypot(dx, dy);
+      const step = Math.max(2, brushSize * 0.15);
+      const n = Math.max(1, Math.floor(dist / step));
+      for (let i = 1; i <= n; i++) {
+        stampBrush(sctx, last.x + (dx * i) / n, last.y + (dy * i) / n);
+      }
+    } else {
+      stampBrush(sctx, docX, docY);
+    }
+    lastPaintRef.current = { x: docX, y: docY };
+    scheduleRedraw();
+  };
+
+  /** Merge the finished stroke into the layer mask, baking its feather. */
+  const commitStroke = () => {
+    const info = strokeInfoRef.current;
+    const stroke = strokeCanvasRef.current;
+    strokeInfoRef.current = null;
+    strokeCanvasRef.current = null;
+    if (!info || !stroke) return;
+    const mask = masksRef.current.get(info.layerId);
+    if (mask) {
+      const mctx = mask.getContext('2d')!;
+      mctx.save();
+      mctx.globalCompositeOperation = info.mode === 'hide' ? 'destination-out' : 'source-over';
+      if (info.feather > 0) mctx.filter = `blur(${info.feather}px)`;
+      mctx.drawImage(stroke, 0, 0);
+      mctx.restore();
+    }
+    redrawAll();
+    markDirty();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Eyedropper — sample a color from the composited canvas onto the background
+  // ---------------------------------------------------------------------------
+  const sampleColorAt = (docX: number, docY: number) => {
+    const dc = docCanvasRef.current;
+    if (!dc) return;
+    const x = Math.max(0, Math.min(dc.width - 1, Math.round(docX)));
+    const y = Math.max(0, Math.min(dc.height - 1, Math.round(docY)));
+    const [r, g, b, a] = dc.getContext('2d')!.getImageData(x, y, 1, 1).data;
+    if (a === 0) return; // transparent spot — nothing to pick
+    const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+    commitBgColor(hex);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Smart Select — SAM 3 (fal) generates a mask from a click or a text concept,
+  // then bakes it into the active layer's mask like an auto-shaped brush stroke.
+  // ---------------------------------------------------------------------------
+  const docToBlob = (): Promise<Blob | null> => new Promise(resolve => {
+    redrawDoc();
+    const dc = docCanvasRef.current;
+    if (!dc) return resolve(null);
+    dc.toBlob(b => resolve(b), 'image/png');
+  });
+
+  const loadImageEl = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+
+  /** Bake a SAM mask (data URI) into the active layer mask as hide/reveal + feather. */
+  const applySelectionMask = async (maskUrl: string, layerId: string) => {
+    const img = await loadImageEl(maskUrl);
+    const dw = docWRef.current, dh = docHRef.current;
+    // Convert the SAM mask (white object) into an alpha stamp.
+    const sel = document.createElement('canvas');
+    sel.width = dw; sel.height = dh;
+    const sctx = sel.getContext('2d')!;
+    sctx.drawImage(img, 0, 0, dw, dh);
+    const idata = sctx.getImageData(0, 0, dw, dh);
+    const d = idata.data;
+    for (let i = 0; i < d.length; i += 4) {
+      // Works whether the mask is white-on-black (opaque) or object-on-transparent.
+      const alpha = ((d[i] + d[i + 1] + d[i + 2]) / 3) * (d[i + 3] / 255);
+      d[i] = 255; d[i + 1] = 255; d[i + 2] = 255; d[i + 3] = alpha;
+    }
+    sctx.putImageData(idata, 0, 0);
+
+    const mask = masksRef.current.get(layerId);
+    if (!mask) return;
+    pushHistory();
+    const mctx = mask.getContext('2d')!;
+    mctx.save();
+    mctx.globalCompositeOperation = maskMode === 'hide' ? 'destination-out' : 'source-over';
+    if (brushFeatherRef.current > 0) mctx.filter = `blur(${brushFeatherRef.current}px)`;
+    mctx.drawImage(sel, 0, 0);
+    mctx.restore();
+    redrawAll();
+    markDirty();
+  };
+
+  const runSmartSelect = async (opts: { prompt?: string; point?: { x: number; y: number } }) => {
+    const id = activeIdRef.current;
+    if (!id) { setSelectMsg('Pick a layer first'); return; }
+    if (!hasFalKey()) { setKeyModalOpen(true); return; }
+    setSelecting(true); setSelectMsg(null);
+    try {
+      const blob = await docToBlob();
+      if (!blob) throw new Error('Nothing to segment');
+      const { maskUrl, count } = await sam3Segment({ imageBlob: blob, prompt: opts.prompt, point: opts.point });
+      if (!maskUrl) { setSelectMsg(opts.prompt ? `No "${opts.prompt}" found` : 'Nothing found there'); return; }
+      await applySelectionMask(maskUrl, id);
+      setSelectMsg(count > 1 ? `Selected ${count} regions` : null);
+    } catch (e: any) {
+      const m = String(e?.message || e);
+      if (/api key|credentials|unauthor|403|401/i.test(m)) { setSelectMsg('Invalid or missing fal key'); setKeyModalOpen(true); }
+      else setSelectMsg(m.slice(0, 120));
+    } finally {
+      setSelecting(false);
+    }
+  };
+
+  const imgToBlob = (img: HTMLImageElement): Promise<Blob | null> => new Promise(resolve => {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d')!.drawImage(img, 0, 0);
+    c.toBlob(b => resolve(b), 'image/png');
+  });
+
+  const canvasToBlob = (c: HTMLCanvasElement): Promise<Blob | null> =>
+    new Promise(resolve => c.toBlob(b => resolve(b), 'image/png'));
+
+  /**
+   * PRESET: isolate the subject and replace the background with a clean neutral
+   * grey studio backdrop. SAM 3 segments the subject → the inverse becomes the
+   * fill mask → FLUX Fill regenerates the background as #3a3a3c. Replaces the
+   * active layer's image with the result (undoable).
+   */
+  const isolateOnGreyPreset = async () => {
+    const id = activeIdRef.current;
+    const layer = layersRef.current.find(l => l.id === id);
+    if (!id || !layer) { setSelectMsg('Pick a layer first'); return; }
+    if (!hasFalKey()) { setKeyModalOpen(true); return; }
+    const asset = assetsRef.current.get(layer.assetId);
+    if (!asset) return;
+    const subject = selectPrompt.trim() || 'person, character';
+    setBusyMsg('Isolating subject with SAM 3…'); setSelectMsg(null);
+    try {
+      const srcBlob = await imgToBlob(asset.img);
+      if (!srcBlob) throw new Error('No image');
+      // 1) Segment the subject.
+      const { maskUrl } = await sam3Segment({ imageBlob: srcBlob, prompt: subject });
+      if (!maskUrl) { setSelectMsg(`No "${subject}" found`); return; }
+
+      // 2) Build the FLUX fill mask = inverse of the subject (white = background
+      //    to regenerate), slightly grown + softened for a seamless blend.
+      const iw = asset.img.naturalWidth, ih = asset.img.naturalHeight;
+      const maskImg = await loadImageEl(maskUrl);
+      const mc = document.createElement('canvas');
+      mc.width = iw; mc.height = ih;
+      const mctx = mc.getContext('2d')!;
+      mctx.drawImage(maskImg, 0, 0, iw, ih);
+      const idata = mctx.getImageData(0, 0, iw, ih);
+      const d = idata.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const subjAlpha = ((d[i] + d[i + 1] + d[i + 2]) / 3) * (d[i + 3] / 255);
+        const bg = 255 - subjAlpha; // invert → background is white
+        d[i] = bg; d[i + 1] = bg; d[i + 2] = bg; d[i + 3] = 255;
+      }
+      mctx.putImageData(idata, 0, 0);
+      const maskBlob = await canvasToBlob(mc);
+      if (!maskBlob) throw new Error('Mask build failed');
+
+      // 3) FLUX Fill the background with a neutral grey studio backdrop.
+      setBusyMsg('Filling background with FLUX…');
+      const resultDataUrl = await fluxFill({
+        imageBlob: srcBlob,
+        maskBlob,
+        prompt: `clean seamless deep neutral grey ${DEFAULT_BG} studio background, smooth even studio lighting, no objects, no props, no shadows, plain solid backdrop`,
+      });
+
+      // 4) Replace the active layer's image with the result (new shared asset).
+      const resultImg = await loadImageEl(resultDataUrl);
+      const newAssetId = newUUID();
+      const name = `${asset.name} · grey`;
+      assetsRef.current.set(newAssetId, { name, w: resultImg.naturalWidth, h: resultImg.naturalHeight, img: resultImg, dataUrl: resultDataUrl });
+      setAssets(prev => [...prev, { id: newAssetId, name, w: resultImg.naturalWidth, h: resultImg.naturalHeight }]);
+      pushHistory();
+      imagesRef.current.set(id, resultImg);
+      setLayers(prev => prev.map(l => (l.id === id ? { ...l, assetId: newAssetId, name } : l)));
+      setTimeout(() => redrawAll(), 0);
+      setSelectMsg('Isolated · grey background');
+    } catch (e: any) {
+      const m = String(e?.message || e);
+      if (/api key|credentials|unauthor|403|401/i.test(m)) { setSelectMsg('Invalid or missing fal key'); setKeyModalOpen(true); }
+      else setSelectMsg(m.slice(0, 140));
+    } finally {
+      setBusyMsg(null);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Tabs — each tab is a document; assets are shared across the whole project.
+  // ---------------------------------------------------------------------------
+  /** Flush the active tab's live state (incl. masks) into tabDocsRef. */
+  const serializeActiveTab = () => {
+    const id = activeTabIdRef.current;
+    if (!id) return;
+    const masks: Record<string, string> = {};
+    masksRef.current.forEach((cv, lid) => { masks[lid] = cv.toDataURL('image/png'); });
+    tabDocsRef.current.set(id, {
+      id,
+      name: tabsMetaRef.current.find(t => t.id === id)?.name || 'Untitled',
+      docW: docWRef.current, docH: docHRef.current,
+      aw: aspectRef.current.w, ah: aspectRef.current.h,
+      bgColor: bgColorRef.current, showBounds: showBoundsRef.current,
+      activeId: activeIdRef.current,
+      layers: layersRef.current.map(l => ({ ...l })),
+      masks,
+    });
+  };
+
+  /** Rebuild the active working state from a serialized tab doc. */
+  const loadTabDoc = async (doc: PersistedTab) => {
+    const imgMap = new Map<string, HTMLImageElement>();
+    const maskMap = new Map<string, HTMLCanvasElement>();
+    await Promise.all(doc.layers.map(async l => {
+      const asset = assetsRef.current.get(l.assetId);
+      if (asset) imgMap.set(l.id, asset.img);
+      const mc = document.createElement('canvas');
+      mc.width = doc.docW; mc.height = doc.docH;
+      const mctx = mc.getContext('2d')!;
+      const murl = doc.masks[l.id];
+      if (murl) { try { mctx.drawImage(await loadImageEl(murl), 0, 0, doc.docW, doc.docH); } catch { mctx.fillStyle = '#fff'; mctx.fillRect(0, 0, doc.docW, doc.docH); } }
+      else { mctx.fillStyle = '#fff'; mctx.fillRect(0, 0, doc.docW, doc.docH); }
+      maskMap.set(l.id, mc);
+    }));
+    const layers = doc.layers.filter(l => imgMap.has(l.id));
+    imagesRef.current = imgMap;
+    masksRef.current = maskMap;
+    docWRef.current = doc.docW; docHRef.current = doc.docH;
+    setDocW(doc.docW); setDocH(doc.docH);
+    setAspect({ w: doc.aw, h: doc.ah });
+    setBgColor(doc.bgColor);
+    setShowBounds(doc.showBounds);
+    setLayers(layers);
+    setActiveId(layers.some(l => l.id === doc.activeId) ? doc.activeId : (layers[layers.length - 1]?.id ?? null));
+    histRef.current = []; redoRef.current = []; bumpHist(); // undo is per-tab
+    setTimeout(() => { fitView(doc.docW, doc.docH); redrawAll(); }, 0);
+  };
+
+  const emptyTabDoc = (name: string): PersistedTab => {
+    const d = dimsForAspect(16, 9);
+    return { id: newUUID(), name, docW: d.w, docH: d.h, aw: 16, ah: 9, bgColor: DEFAULT_BG, showBounds: true, activeId: null, layers: [], masks: {} };
+  };
+
+  const switchTab = async (tabId: string) => {
+    if (tabId === activeTabIdRef.current) return;
+    serializeActiveTab();
+    const doc = tabDocsRef.current.get(tabId);
+    if (!doc) return;
+    setActiveTabId(tabId); activeTabIdRef.current = tabId;
+    await loadTabDoc(doc);
+    markDirty();
+  };
+
+  const newTab = async () => {
+    serializeActiveTab();
+    const doc = emptyTabDoc(`Tab ${tabsMetaRef.current.length + 1}`);
+    tabDocsRef.current.set(doc.id, doc);
+    setTabsMeta(prev => [...prev, { id: doc.id, name: doc.name }]);
+    setActiveTabId(doc.id); activeTabIdRef.current = doc.id;
+    await loadTabDoc(doc);
+    markDirty();
+  };
+
+  const closeTab = async (tabId: string) => {
+    const meta = tabsMetaRef.current;
+    const idx = meta.findIndex(t => t.id === tabId);
+    if (idx < 0) return;
+    const remaining = meta.filter(t => t.id !== tabId);
+    tabDocsRef.current.delete(tabId);
+    if (remaining.length === 0) {
+      const doc = emptyTabDoc('Tab 1');
+      tabDocsRef.current.set(doc.id, doc);
+      setTabsMeta([{ id: doc.id, name: doc.name }]);
+      setActiveTabId(doc.id); activeTabIdRef.current = doc.id;
+      await loadTabDoc(doc);
+    } else {
+      setTabsMeta(remaining);
+      if (activeTabIdRef.current === tabId) {
+        const target = remaining[Math.max(0, idx - 1)];
+        setActiveTabId(target.id); activeTabIdRef.current = target.id;
+        const doc = tabDocsRef.current.get(target.id);
+        if (doc) await loadTabDoc(doc);
+      }
+    }
+    markDirty();
+  };
+
+  const renameTab = (tabId: string, name: string) => {
+    setTabsMeta(prev => prev.map(t => (t.id === tabId ? { ...t, name: name || t.name } : t)));
+    const doc = tabDocsRef.current.get(tabId);
+    if (doc) doc.name = name || doc.name;
+    markDirty();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Persistence (IndexedDB) — autosave the whole project, hydrate on mount
+  // ---------------------------------------------------------------------------
+  const captureProject = (): PersistedProject => {
+    serializeActiveTab();
+    const assetsObj: PersistedProject['assets'] = {};
+    assetsRef.current.forEach((a, id) => { assetsObj[id] = { name: a.name, w: a.w, h: a.h, dataUrl: a.dataUrl }; });
+    const tabs = tabsMetaRef.current.map(m => tabDocsRef.current.get(m.id)).filter(Boolean) as PersistedTab[];
+    return { v: 2, activeTabId: activeTabIdRef.current, assets: assetsObj, tabs };
+  };
+
+  const markDirty = () => {
+    if (hydratingRef.current) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveProject(captureProject()).catch(() => { /* ignore quota/errors */ });
+    }, 800);
+  };
+
+  const hydrate = async () => {
+    const proj = await loadProject();
+    if (!proj || !proj.tabs.length) {
+      // Fresh project: one empty tab.
+      const doc = emptyTabDoc('Tab 1');
+      tabDocsRef.current.set(doc.id, doc);
+      setTabsMeta([{ id: doc.id, name: doc.name }]);
+      setActiveTabId(doc.id); activeTabIdRef.current = doc.id;
+      hydratingRef.current = false;
+      return;
+    }
+    // Rebuild shared assets.
+    const amap = new Map<string, { name: string; w: number; h: number; img: HTMLImageElement; dataUrl: string }>();
+    const alist: ProjectAsset[] = [];
+    await Promise.all(Object.entries(proj.assets).map(async ([id, a]) => {
+      try {
+        const img = await loadImageEl(a.dataUrl);
+        amap.set(id, { name: a.name, w: a.w || img.naturalWidth, h: a.h || img.naturalHeight, img, dataUrl: a.dataUrl });
+        alist.push({ id, name: a.name, w: a.w || img.naturalWidth, h: a.h || img.naturalHeight });
+      } catch { /* skip broken asset */ }
+    }));
+    assetsRef.current = amap;
+    setAssets(alist);
+    proj.tabs.forEach(t => tabDocsRef.current.set(t.id, t));
+    setTabsMeta(proj.tabs.map(t => ({ id: t.id, name: t.name })));
+    const activeId = proj.tabs.some(t => t.id === proj.activeTabId) ? proj.activeTabId! : proj.tabs[0].id;
+    setActiveTabId(activeId); activeTabIdRef.current = activeId;
+    await loadTabDoc(tabDocsRef.current.get(activeId)!);
+    hydratingRef.current = false;
+  };
+
+  useEffect(() => { hydrate(); /* eslint-disable-next-line */ }, []);
+  // Autosave when persisted state changes; mask-pixel edits call markDirty directly.
+  useEffect(() => { markDirty(); /* eslint-disable-next-line */ }, [layers, bgColor, showBounds, docW, docH, aspect, activeId, tabsMeta, activeTabId, assets]);
+
+  // ---------------------------------------------------------------------------
+  // Undo / redo
+  // ---------------------------------------------------------------------------
+  const loadMaskCanvas = (url: string) => new Promise<HTMLCanvasElement>(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      c.getContext('2d')!.drawImage(img, 0, 0);
+      resolve(c);
+    };
+    img.src = url;
+  });
+
+  const captureSnapshot = (): Snapshot => {
+    const masks: Record<string, string> = {};
+    masksRef.current.forEach((cv, id) => { masks[id] = cv.toDataURL('image/png'); });
+    return {
+      layers: layersRef.current.map(l => ({ ...l })),
+      masks,
+      bgColor: bgColorRef.current,
+      aw: aspectRef.current.w, ah: aspectRef.current.h,
+      docW: docWRef.current, docH: docHRef.current,
+      activeId: activeIdRef.current,
+    };
+  };
+
+  /** Record the current state so the next mutation can be undone. */
+  const pushHistory = () => {
+    histRef.current.push(captureSnapshot());
+    if (histRef.current.length > 60) histRef.current.shift();
+    redoRef.current = [];
+    bumpHist();
+  };
+
+  const restoreSnapshot = async (snap: Snapshot) => {
+    const newMasks = new Map<string, HTMLCanvasElement>();
+    await Promise.all(Object.entries(snap.masks).map(async ([id, url]) => {
+      newMasks.set(id, await loadMaskCanvas(url));
+    }));
+    masksRef.current = newMasks;
+    // Rebuild the per-layer image map from each layer's asset (assetId can
+    // change, e.g. the isolate preset swaps a layer's image).
+    const imgMap = new Map<string, HTMLImageElement>();
+    for (const l of snap.layers) { const a = assetsRef.current.get(l.assetId); if (a) imgMap.set(l.id, a.img); }
+    imagesRef.current = imgMap;
+    docWRef.current = snap.docW; docHRef.current = snap.docH;
+    setDocW(snap.docW); setDocH(snap.docH);
+    setBgColor(snap.bgColor);
+    setAspect({ w: snap.aw, h: snap.ah });
+    setLayers(snap.layers.map(l => ({ ...l })));
+    setActiveId(snap.activeId);
+    setTimeout(() => redrawAll(), 0);
+  };
+
+  const undo = async () => {
+    if (!histRef.current.length) return;
+    redoRef.current.push(captureSnapshot());
+    const snap = histRef.current.pop()!;
+    await restoreSnapshot(snap);
+    bumpHist();
+  };
+
+  const redo = async () => {
+    if (!redoRef.current.length) return;
+    histRef.current.push(captureSnapshot());
+    const snap = redoRef.current.pop()!;
+    await restoreSnapshot(snap);
+    bumpHist();
+  };
+
+  /** Set the background as an undoable action. */
+  const commitBgColor = (v: string | null) => { pushHistory(); setBgColor(v); };
+
+  // Keyboard: tool hotkeys, space-to-pan, zoom, undo/redo.
+  const [spacePan, setSpacePan] = useState(false);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const typing = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+      const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+      if (meta && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
+      if (meta || typing) return;
+      switch (e.key.toLowerCase()) {
+        case 'v': setTool('move'); break;
+        case 'b': setTool('mask'); break;
+        case 'h': setTool('hand'); break;
+        case 's': setTool('select'); break;
+        case 'c': setTool('crop'); break;
+        case 'i': case 'e': setTool('eyedropper'); break;
+        case 'f': fitView(); drawView(); break;
+        case 'l': autoLayout(); break;
+        case '=': case '+': zoomBy(1.2); break;
+        case '-': case '_': zoomBy(1 / 1.2); break;
+        case ' ':
+          e.preventDefault();
+          if (!spaceRef.current) { spaceRef.current = true; setSpacePan(true); }
+          break;
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === ' ') { spaceRef.current = false; setSpacePan(false); }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); };
+    /* eslint-disable-next-line */
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Pointer events
+  // ---------------------------------------------------------------------------
+  const onPointerDown = (e: React.PointerEvent) => {
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    const isPan = tool === 'hand' || spaceRef.current || e.button === 1 || e.altKey;
+    if (isPan) {
+      dragRef.current = { mode: 'pan', sx: e.clientX, sy: e.clientY, ox: viewOffRef.current.x, oy: viewOffRef.current.y };
+      return;
+    }
+    const p = screenToDoc(e.clientX, e.clientY);
+    if (tool === 'eyedropper') {
+      sampleColorAt(p.x, p.y);
+      return;
+    }
+    if (tool === 'select') {
+      const dw = docWRef.current, dh = docHRef.current;
+      if (p.x < 0 || p.y < 0 || p.x > dw || p.y > dh) return; // ignore clicks off the artboard
+      if (!selecting) runSmartSelect({ point: { x: p.x, y: p.y } });
+      return;
+    }
+    if (tool === 'crop') {
+      if (!activeIdRef.current) return;
+      cropRectRef.current = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      dragRef.current = { mode: 'crop', sx: e.clientX, sy: e.clientY, ox: 0, oy: 0 };
+      scheduleRedraw();
+      return;
+    }
+    if (tool === 'mask') {
+      const id = activeIdRef.current;
+      if (!id) return;
+      pushHistory();
+      // Fresh buffer for this stroke, at doc resolution.
+      const buf = document.createElement('canvas');
+      buf.width = docWRef.current; buf.height = docHRef.current;
+      strokeCanvasRef.current = buf;
+      strokeInfoRef.current = { layerId: id, mode: maskMode, feather: brushFeatherRef.current };
+      dragRef.current = { mode: 'paint', sx: e.clientX, sy: e.clientY, ox: 0, oy: 0 };
+      lastPaintRef.current = null;
+      paintAt(p.x, p.y);
+    } else if (tool === 'move') {
+      const active = layersRef.current.find(l => l.id === activeIdRef.current);
+      movePushedRef.current = false;
+      dragRef.current = { mode: 'move', sx: p.x, sy: p.y, ox: active?.x ?? 0, oy: active?.y ?? 0 };
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    // Brush cursor overlay.
+    if (cursorRef.current) {
+      const cont = containerRef.current!;
+      const rect = cont.getBoundingClientRect();
+      const size = brushSize * viewScaleRef.current;
+      cursorRef.current.style.width = `${size}px`;
+      cursorRef.current.style.height = `${size}px`;
+      cursorRef.current.style.left = `${e.clientX - rect.left}px`;
+      cursorRef.current.style.top = `${e.clientY - rect.top}px`;
+      cursorRef.current.style.display = (tool === 'mask' && !spaceRef.current) ? 'block' : 'none';
+    }
+
+    const d = dragRef.current;
+    if (!d) return;
+    if (d.mode === 'pan') {
+      viewOffRef.current = { x: d.ox + (e.clientX - d.sx), y: d.oy + (e.clientY - d.sy) };
+      clampView();
+      scheduleRedraw();
+    } else if (d.mode === 'paint') {
+      const p = screenToDoc(e.clientX, e.clientY);
+      paintAt(p.x, p.y);
+    } else if (d.mode === 'move') {
+      const p = screenToDoc(e.clientX, e.clientY);
+      const nx = d.ox + (p.x - d.sx);
+      const ny = d.oy + (p.y - d.sy);
+      if (!movePushedRef.current) { pushHistory(); movePushedRef.current = true; }
+      const id = activeIdRef.current;
+      setLayers(prev => prev.map(l => (l.id === id ? { ...l, x: nx, y: ny } : l)));
+    } else if (d.mode === 'crop' && cropRectRef.current) {
+      const p = screenToDoc(e.clientX, e.clientY);
+      cropRectRef.current = { ...cropRectRef.current, x1: p.x, y1: p.y };
+      scheduleRedraw();
+    }
+  };
+
+  const onPointerUp = () => {
+    const mode = dragRef.current?.mode;
+    dragRef.current = null;
+    lastPaintRef.current = null;
+    if (mode === 'paint') commitStroke();
+    else if (mode === 'crop') commitCrop();
+  };
+
+  /** Apply the crop marquee to the active layer as a rectangular mask. */
+  const commitCrop = () => {
+    const r = cropRectRef.current;
+    cropRectRef.current = null;
+    const id = activeIdRef.current;
+    if (!r || !id) { scheduleRedraw(); return; }
+    const dw = docWRef.current, dh = docHRef.current;
+    let x = Math.max(0, Math.min(r.x0, r.x1));
+    let y = Math.max(0, Math.min(r.y0, r.y1));
+    let w = Math.min(dw, Math.max(r.x0, r.x1)) - x;
+    let h = Math.min(dh, Math.max(r.y0, r.y1)) - y;
+    if (w < 4 || h < 4) { scheduleRedraw(); return; } // ignore tiny/accidental drags
+    pushHistory();
+    setRectMask(id, x, y, w, h);
+    redrawAll();
+    markDirty();
+  };
+
+  const onWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const cv = viewCanvasRef.current!;
+    const rect = cv.getBoundingClientRect();
+    // Ctrl/Cmd + wheel (and trackpad pinch) → zoom to cursor. Plain wheel → pan.
+    if (e.ctrlKey || e.metaKey) {
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const s0 = viewScaleRef.current;
+      const factor = Math.exp(-e.deltaY * 0.01);
+      const s1 = s0 * factor;
+      const off = viewOffRef.current;
+      viewOffRef.current = {
+        x: mx - ((mx - off.x) * s1) / s0,
+        y: my - ((my - off.y) * s1) / s0,
+      };
+      viewScaleRef.current = s1;
+    } else {
+      viewOffRef.current = {
+        x: viewOffRef.current.x - e.deltaX,
+        y: viewOffRef.current.y - e.deltaY,
+      };
+    }
+    clampView();
+    scheduleRedraw();
+  };
+
+  const zoomBy = (factor: number) => {
+    const cont = containerRef.current;
+    if (!cont) return;
+    const cx = cont.clientWidth / 2, cy = cont.clientHeight / 2;
+    const s0 = viewScaleRef.current;
+    const s1 = s0 * factor;
+    const off = viewOffRef.current;
+    viewOffRef.current = { x: cx - ((cx - off.x) * s1) / s0, y: cy - ((cy - off.y) * s1) / s0 };
+    viewScaleRef.current = s1;
+    clampView();
+    drawView();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Layer ops
+  // ---------------------------------------------------------------------------
+  const patchLayer = (id: string, patch: Partial<CompLayer>) =>
+    setLayers(prev => prev.map(l => (l.id === id ? { ...l, ...patch } : l)));
+
+  const removeLayer = (id: string) => {
+    pushHistory();
+    // Keep the source image in imagesRef so an undo can restore the layer.
+    masksRef.current.delete(id);
+    setLayers(prev => {
+      const out = prev.filter(l => l.id !== id);
+      if (activeIdRef.current === id) setActiveId(out.length ? out[out.length - 1].id : null);
+      return out;
+    });
+  };
+
+  const moveLayer = (id: string, dir: -1 | 1) => {
+    pushHistory();
+    setLayers(prev => {
+      const i = prev.findIndex(l => l.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const out = [...prev];
+      [out[i], out[j]] = [out[j], out[i]];
+      return out;
+    });
+  };
+
+  const clearMask = (id: string) => {
+    const mask = masksRef.current.get(id);
+    if (!mask) return;
+    pushHistory();
+    const mctx = mask.getContext('2d')!;
+    mctx.globalCompositeOperation = 'source-over';
+    mctx.fillStyle = '#fff';
+    mctx.fillRect(0, 0, mask.width, mask.height);
+    redrawAll();
+    markDirty();
+  };
+
+  const invertMask = (id: string) => {
+    const mask = masksRef.current.get(id);
+    if (!mask) return;
+    pushHistory();
+    const mctx = mask.getContext('2d')!;
+    const img = mctx.getImageData(0, 0, mask.width, mask.height);
+    const d = img.data;
+    for (let i = 3; i < d.length; i += 4) d[i] = 255 - d[i];
+    mctx.putImageData(img, 0, 0);
+    redrawAll();
+    markDirty();
+  };
+
+  const resetTransform = (id: string) => {
+    const img = imagesRef.current.get(id);
+    if (!img) return;
+    pushHistory();
+    const dw = docWRef.current, dh = docHRef.current;
+    const fit = Math.min(dw / img.naturalWidth, dh / img.naturalHeight);
+    const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
+    patchLayer(id, { scale: fit, rotation: 0, x: (dw - w) / 2, y: (dh - h) / 2 });
+  };
+
+  const fillDoc = (id: string) => {
+    const img = imagesRef.current.get(id);
+    if (!img) return;
+    pushHistory();
+    const dw = docWRef.current, dh = docHRef.current;
+    const cover = Math.max(dw / img.naturalWidth, dh / img.naturalHeight);
+    const w = img.naturalWidth * cover, h = img.naturalHeight * cover;
+    patchLayer(id, { scale: cover, rotation: 0, x: (dw - w) / 2, y: (dh - h) / 2 });
+  };
+
+  // Set a layer's mask to a single opaque rectangle (crops the layer to it).
+  const setRectMask = (layerId: string, rx: number, ry: number, rw: number, rh: number) => {
+    const dw = docWRef.current, dh = docHRef.current;
+    const mask = blankMaskTransparent(dw, dh);
+    const mctx = mask.getContext('2d')!;
+    mctx.fillStyle = '#fff';
+    mctx.fillRect(rx, ry, rw, rh);
+    masksRef.current.set(layerId, mask);
+  };
+
+  const blankMaskTransparent = (dw: number, dh: number) => {
+    const c = document.createElement('canvas');
+    c.width = dw; c.height = dh;
+    return c; // fully transparent → nothing shown until a rect is painted
+  };
+
+  // ---------------------------------------------------------------------------
+  // Auto Layout — tile the WHOLE artboard with the layers so it is fully filled
+  // for the chosen aspect ratio. Each image is scaled to *cover* its cell and
+  // cropped to it (via a rectangular mask), so there are never empty gaps. The
+  // grid shape (rows × columns) is chosen to minimise how much each image is
+  // cropped, adapting to the images' orientations and the artboard aspect.
+  // ---------------------------------------------------------------------------
+  const autoLayout = (gapPct = 0) => {
+    const items = layersRef.current
+      .map(l => { const img = imagesRef.current.get(l.id); return img ? { id: l.id, ar: img.naturalWidth / img.naturalHeight, img } : null; })
+      .filter(Boolean) as { id: string; ar: number; img: HTMLImageElement }[];
+    const n = items.length;
+    if (n === 0) return;
+    const dw = docWRef.current, dh = docHRef.current;
+    const gap = Math.round((dw * gapPct) / 100);
+
+    // Distribute n items into r rows as evenly as possible (contiguous).
+    const rowsFor = (r: number) => {
+      const base = Math.floor(n / r), extra = n % r;
+      const counts: number[] = [];
+      for (let i = 0; i < r; i++) counts.push(base + (i < extra ? 1 : 0));
+      return counts;
+    };
+
+    // Cost of a grid = how far each cell's aspect is from its image's aspect
+    // (log-ratio); lower means less cropping.
+    const cost = (r: number) => {
+      const counts = rowsFor(r);
+      const cellH = (dh - gap * (r + 1)) / r;
+      let c = 0, idx = 0;
+      for (const cCount of counts) {
+        const cellW = (dw - gap * (cCount + 1)) / cCount;
+        const cellAR = cellW / cellH;
+        for (let k = 0; k < cCount; k++) { c += Math.abs(Math.log(cellAR / items[idx].ar)); idx++; }
+      }
+      return c;
+    };
+
+    let bestR = 1, bestCost = Infinity;
+    for (let r = 1; r <= n; r++) { const c = cost(r); if (c < bestCost) { bestCost = c; bestR = r; } }
+
+    const counts = rowsFor(bestR);
+    const cellH = (dh - gap * (bestR + 1)) / bestR;
+
+    pushHistory();
+    const patches = new Map<string, Partial<CompLayer>>();
+    let idx = 0;
+    let y = gap;
+    for (const cCount of counts) {
+      const cellW = (dw - gap * (cCount + 1)) / cCount;
+      let x = gap;
+      for (let k = 0; k < cCount; k++) {
+        const it = items[idx++];
+        const cover = Math.max(cellW / it.img.naturalWidth, cellH / it.img.naturalHeight);
+        const w = it.img.naturalWidth * cover, h = it.img.naturalHeight * cover;
+        // Center the covered image on the cell, crop to the cell via a rect mask.
+        patches.set(it.id, { x: x + (cellW - w) / 2, y: y + (cellH - h) / 2, scale: cover, rotation: 0 });
+        setRectMask(it.id, x, y, cellW, cellH);
+        x += cellW + gap;
+      }
+      y += cellH + gap;
+    }
+    setLayers(prev => prev.map(l => (patches.has(l.id) ? { ...l, ...patches.get(l.id)! } : l)));
+    markDirty();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Export @ 2K
+  // ---------------------------------------------------------------------------
+  const [exporting, setExporting] = useState(false);
+  const exportImage = () => {
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh) return;
+    setExporting(true);
+    try {
+      const long = Math.max(dw, dh);
+      const k = EXPORT_LONG_EDGE / long;
+      const out = document.createElement('canvas');
+      out.width = Math.round(dw * k);
+      out.height = Math.round(dh * k);
+      const ctx = out.getContext('2d')!;
+      ctx.imageSmoothingQuality = 'high';
+      compositeInto(ctx, k);
+      const url = out.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `layer-studio-${out.width}x${out.height}.png`;
+      a.click();
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // File drop
+  const [dragOver, setDragOver] = useState(false);
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer.files?.length) importFiles(e.dataTransfer.files);
+  };
+
+  const active = layers.find(l => l.id === activeId);
+  const hasLayers = layers.length > 0;
+  const isCustomBg = bgColor !== null && !BG_SWATCHES.some(s => s.value === bgColor);
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+  return (
+    <div className="w-full h-full flex flex-col bg-background text-primary select-none">
+      {/* Tab bar */}
+      <div className="h-9 shrink-0 border-b border-border flex items-stretch pl-2 pr-1 gap-0.5 overflow-x-auto no-scrollbar">
+        {tabsMeta.map(t => {
+          const active = t.id === activeTabId;
+          return (
+            <div key={t.id}
+              onClick={() => switchTab(t.id)}
+              onDoubleClick={() => { setRenamingTabId(t.id); }}
+              className={`group relative flex items-center gap-2 pl-3 pr-2 h-full cursor-pointer border-b-2 max-w-[180px] ${active ? 'border-accent text-primary' : 'border-transparent text-secondary hover:text-primary'}`}>
+              {renamingTabId === t.id ? (
+                <input
+                  autoFocus
+                  defaultValue={t.name}
+                  onClick={e => e.stopPropagation()}
+                  onBlur={e => { renameTab(t.id, e.target.value.trim()); setRenamingTabId(null); }}
+                  onKeyDown={e => { if (e.key === 'Enter') { renameTab(t.id, (e.target as HTMLInputElement).value.trim()); setRenamingTabId(null); } if (e.key === 'Escape') setRenamingTabId(null); }}
+                  className="bg-surface border border-accent rounded px-1 text-xs w-24 focus:outline-none"
+                />
+              ) : (
+                <span className="text-xs truncate">{t.name}</span>
+              )}
+              <button
+                onClick={e => { e.stopPropagation(); closeTab(t.id); }}
+                className={`shrink-0 rounded p-0.5 text-secondary hover:text-primary hover:bg-surface ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
+                title="Close tab">
+                <X size={12} />
+              </button>
+            </div>
+          );
+        })}
+        <button onClick={newTab} title="New tab"
+          className="shrink-0 self-center ml-1 w-6 h-6 flex items-center justify-center rounded text-secondary hover:text-primary hover:bg-surface">
+          <Plus size={15} />
+        </button>
+      </div>
+
+      <div className="flex-1 flex min-h-0">
+      {/* Tool rail */}
+      <div className="w-14 shrink-0 border-r border-border flex flex-col items-center py-4 gap-2">
+        <ToolBtn icon={<Move size={18} />} label="Move / Transform — V" active={tool === 'move'} onClick={() => setTool('move')} />
+        <ToolBtn icon={<Brush size={18} />} label="Mask brush — B" active={tool === 'mask'} onClick={() => setTool('mask')} />
+        <ToolBtn icon={<Wand2 size={18} />} label="Smart Select (SAM 3) — S" active={tool === 'select'} onClick={() => setTool('select')} />
+        <ToolBtn icon={<Crop size={18} />} label="Crop active layer — C" active={tool === 'crop'} onClick={() => setTool('crop')} />
+        <ToolBtn icon={<Hand size={18} />} label="Pan — H  (or hold Space / Alt)" active={tool === 'hand' || spacePan} onClick={() => setTool('hand')} />
+        <ToolBtn icon={<Pipette size={18} />} label="Eyedropper → background — I" active={tool === 'eyedropper'} onClick={() => setTool('eyedropper')} />
+        <div className="h-px w-8 bg-border my-1" />
+        <ToolBtn icon={<Upload size={18} />} label="Import image" onClick={() => fileInputRef.current?.click()} />
+        <input ref={fileInputRef} type="file" accept="image/*" multiple hidden
+          onChange={e => e.target.files && importFiles(e.target.files)} />
+      </div>
+
+      {/* Canvas stage */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Context toolbar */}
+        <div className="h-14 shrink-0 border-b border-border flex items-center gap-4 px-5">
+          <div className="flex items-center gap-2 text-secondary shrink-0">
+            <LayersIcon size={16} className="text-accent" />
+            <span className="font-mono text-[10px] uppercase tracking-widest">Layer Studio</span>
+          </div>
+
+          {/* Scrollable brush controls — never pushes the Export cluster off-screen. */}
+          <div className="flex-1 min-w-0 flex items-center overflow-x-auto no-scrollbar">
+            {tool === 'select' && (
+              <div className="flex items-center gap-3 animate-fade-in whitespace-nowrap">
+                <div className="flex items-center bg-surface rounded-lg p-0.5">
+                  <SegBtn active={maskMode === 'hide'} onClick={() => setMaskMode('hide')} icon={<Eraser size={13} />}>Hide</SegBtn>
+                  <SegBtn active={maskMode === 'reveal'} onClick={() => setMaskMode('reveal')} icon={<Paintbrush size={13} />}>Reveal</SegBtn>
+                </div>
+                <input
+                  value={selectPrompt}
+                  onChange={e => setSelectPrompt(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && selectPrompt.trim() && !selecting) runSmartSelect({ prompt: selectPrompt }); }}
+                  placeholder="describe what to select — e.g. the sky"
+                  className="w-56 bg-surface border border-border rounded-lg px-3 py-1.5 text-xs text-primary placeholder:text-secondary/60 focus:outline-none focus:border-accent"
+                />
+                <button
+                  onClick={() => selectPrompt.trim() && !selecting && runSmartSelect({ prompt: selectPrompt })}
+                  disabled={selecting || !selectPrompt.trim()}
+                  className="flex items-center gap-1.5 bg-inverse text-inverseText text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-40">
+                  {selecting ? <Loader2 size={13} className="animate-spin" /> : <Wand2 size={13} />} Select
+                </button>
+                <span className="font-mono text-[10px] text-secondary">or click an object</span>
+                <span className="w-px h-5 bg-border" />
+                <button
+                  onClick={() => !busyMsg && !selecting && isolateOnGreyPreset()}
+                  disabled={!!busyMsg || selecting}
+                  title="Isolate the subject and replace the background with a neutral grey studio fill (SAM 3 + FLUX)"
+                  className="flex items-center gap-1.5 bg-accent text-white text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-40">
+                  <Sparkles size={13} /> Isolate → grey BG
+                </button>
+                {selectMsg && <span className="font-mono text-[10px] text-accent">{selectMsg}</span>}
+                <button onClick={() => { setKeyInput(getFalKey()); setKeyModalOpen(true); }}
+                  className="flex items-center gap-1 text-[10px] font-mono text-secondary hover:text-primary" title="fal API key">
+                  <KeyRound size={12} /> {hasFalKey() ? 'key set' : 'set key'}
+                </button>
+              </div>
+            )}
+            {tool === 'mask' && (
+              <div className="flex items-center gap-5 animate-fade-in whitespace-nowrap">
+                <div className="flex items-center bg-surface rounded-lg p-0.5">
+                  <SegBtn active={maskMode === 'hide'} onClick={() => setMaskMode('hide')} icon={<Eraser size={13} />}>Hide</SegBtn>
+                  <SegBtn active={maskMode === 'reveal'} onClick={() => setMaskMode('reveal')} icon={<Paintbrush size={13} />}>Reveal</SegBtn>
+                </div>
+                <Slider label="Size" value={brushSize} min={5} max={600} step={1} onChange={setBrushSize} suffix="px" w={90} />
+                <Slider label="Softness" value={Math.round((1 - brushHardness) * 100)} min={0} max={100} step={1}
+                  onChange={v => setBrushHardness(1 - v / 100)} suffix="%" w={80} />
+                <Slider label="Flow" value={Math.round(brushFlow * 100)} min={5} max={100} step={1}
+                  onChange={v => setBrushFlow(v / 100)} suffix="%" w={70} />
+                <Slider label="Feather" value={brushFeather} min={0} max={80} step={1}
+                  onChange={setBrushFeather} suffix="px" w={80} />
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 shrink-0 pl-2">
+            <div className="flex items-center">
+              <button onClick={undo} disabled={histRef.current.length === 0} title="Undo (⌘Z)"
+                className="text-secondary hover:text-primary disabled:opacity-30 disabled:hover:text-secondary p-1.5 rounded hover:bg-surface shrink-0">
+                <Undo2 size={15} />
+              </button>
+              <button onClick={redo} disabled={redoRef.current.length === 0} title="Redo (⌘⇧Z)"
+                className="text-secondary hover:text-primary disabled:opacity-30 disabled:hover:text-secondary p-1.5 rounded hover:bg-surface shrink-0">
+                <Redo2 size={15} />
+              </button>
+            </div>
+            <span className="font-mono text-[10px] text-secondary tabular-nums">{zoomPct}%</span>
+            <span className="font-mono text-[10px] text-secondary">{docW}×{docH}</span>
+            <button onClick={() => autoLayout()} disabled={!hasLayers}
+              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Auto Layout — pack layers to fill the artboard (L)">
+              <LayoutGrid size={13} /> Auto
+            </button>
+            <button onClick={() => { fitView(); drawView(); }}
+              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0" title="Fit (F)">
+              <Maximize size={13} /> Fit
+            </button>
+            <button onClick={exportImage} disabled={exporting}
+              className="flex items-center gap-2 bg-accent text-white text-xs font-medium px-4 py-2 rounded-lg hover:opacity-90 disabled:opacity-40 transition-opacity shrink-0 whitespace-nowrap">
+              <Download size={14} /> {exporting ? 'Exporting…' : 'Export 2K'}
+            </button>
+          </div>
+        </div>
+
+        {/* Stage */}
+        <div
+          ref={containerRef}
+          className="flex-1 relative overflow-hidden"
+          style={{ background: 'var(--bg-surface)' }}
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={onDrop}
+        >
+          <canvas
+            ref={viewCanvasRef}
+            className="absolute inset-0"
+            style={{ cursor: (spacePan || tool === 'hand') ? 'grab' : tool === 'move' ? 'move' : (tool === 'eyedropper' || tool === 'select' || tool === 'crop') ? 'crosshair' : 'none', touchAction: 'none' }}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerLeave={() => { onPointerUp(); if (cursorRef.current) cursorRef.current.style.display = 'none'; }}
+            onWheel={onWheel}
+          />
+          {/* Brush cursor */}
+          <div
+            ref={cursorRef}
+            className="absolute pointer-events-none rounded-full border-2"
+            style={{
+              display: 'none',
+              transform: 'translate(-50%, -50%)',
+              borderColor: maskMode === 'hide' ? 'rgba(255,85,46,0.9)' : 'rgba(120,183,145,0.95)',
+              boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
+            }}
+          />
+
+          {!hasLayers && !dragOver && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 pointer-events-none">
+              <div className="w-16 h-16 border-2 border-dashed border-white/40 rounded-2xl flex items-center justify-center">
+                <Upload size={24} className="text-white/60" />
+              </div>
+              <p className="font-mono text-[10px] uppercase tracking-widest text-white/70">
+                Drop images or import to start compositing
+              </p>
+            </div>
+          )}
+          {dragOver && (
+            <div className="absolute inset-4 z-20 border-2 border-dashed border-accent bg-accent/5 rounded-2xl flex items-center justify-center pointer-events-none">
+              <span className="font-serif text-lg bg-background px-6 py-3 rounded-full border border-accent/30 shadow-elevated">Drop to add layer</span>
+            </div>
+          )}
+
+          {/* Navigation hint + zoom controls */}
+          <div className="absolute bottom-3 left-3 pointer-events-none">
+            <span className="font-mono text-[9px] text-secondary/70 tracking-wide">
+              Space/Alt-drag or scroll to pan · ⌘-scroll to zoom · ⌘Z undo
+            </span>
+          </div>
+          <div className="absolute bottom-3 right-3 flex items-center gap-1 bg-background/80 backdrop-blur border border-border rounded-lg px-1 py-0.5 shadow-sm">
+            <button onClick={() => zoomBy(1 / 1.2)} className="w-6 h-6 flex items-center justify-center text-secondary hover:text-primary rounded" title="Zoom out (−)">−</button>
+            <button onClick={() => { fitView(); drawView(); }} className="font-mono text-[10px] text-secondary hover:text-primary px-1.5 tabular-nums" title="Fit (F)">{zoomPct}%</button>
+            <button onClick={() => zoomBy(1.2)} className="w-6 h-6 flex items-center justify-center text-secondary hover:text-primary rounded" title="Zoom in (+)">+</button>
+          </div>
+
+          {/* Smart Select working overlay */}
+          {(selecting || busyMsg) && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 backdrop-blur-[1px] pointer-events-none">
+              <div className="flex items-center gap-3 bg-background border border-border rounded-full px-5 py-3 shadow-elevated">
+                <Loader2 size={18} className="animate-spin text-accent" />
+                <span className="font-serif text-base text-primary">{busyMsg || 'Segmenting with SAM 3…'}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Layers panel */}
+      <div className="w-72 shrink-0 border-l border-border flex flex-col">
+        <div className="h-14 shrink-0 border-b border-border flex items-center justify-between px-4">
+          <span className="font-mono text-[10px] uppercase tracking-widest text-secondary">Layers</span>
+          <button onClick={() => fileInputRef.current?.click()}
+            className="text-secondary hover:text-accent transition-colors" title="Import">
+            <Upload size={16} />
+          </button>
+        </div>
+
+        {/* Artboard settings */}
+        <div className="border-b border-border px-4 py-4 space-y-3">
+          <div className="flex items-center gap-1.5 text-secondary">
+            <Frame size={12} className="text-accent" />
+            <span className="font-mono text-[10px] uppercase tracking-widest">Artboard</span>
+            <span className="ml-auto font-mono text-[10px] text-primary tabular-nums">{docW}×{docH}</span>
+          </div>
+          <div className="grid grid-cols-4 gap-1.5">
+            {ASPECTS.map(a => (
+              <button key={a.label} onClick={() => applyAspect(a.w, a.h)}
+                className={`text-[10px] font-mono py-1.5 rounded border transition-colors ${aspect.w === a.w && aspect.h === a.h ? 'border-accent text-accent bg-accentDim' : 'border-border text-secondary hover:text-primary hover:border-accent/50'}`}>
+                {a.label}
+              </button>
+            ))}
+          </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-wide text-secondary">Background</span>
+              {isCustomBg && <span className="text-[10px] font-mono text-primary uppercase tabular-nums">{bgColor}</span>}
+            </div>
+            <div className="flex items-center gap-2 mt-1.5">
+              {BG_SWATCHES.map(sw => {
+                const activeSw = bgColor === sw.value;
+                return (
+                  <button key={sw.label} onClick={() => commitBgColor(sw.value)} title={sw.label}
+                    className={`w-7 h-7 rounded-md border-2 transition-all ${activeSw ? 'border-accent scale-105' : 'border-border'}`}
+                    style={sw.value
+                      ? { background: sw.value }
+                      : { backgroundImage: 'linear-gradient(45deg,#888 25%,transparent 25%,transparent 75%,#888 75%),linear-gradient(45deg,#888 25%,#ccc 25%,#ccc 75%,#888 75%)', backgroundSize: '8px 8px', backgroundPosition: '0 0,4px 4px' }} />
+                );
+              })}
+              <label className={`ml-auto relative w-7 h-7 rounded-md border-2 overflow-hidden cursor-pointer transition-all ${isCustomBg ? 'border-accent scale-105' : 'border-border'}`}
+                title="Custom color (or use the eyedropper)"
+                style={{ background: isCustomBg ? (bgColor as string) : undefined }}>
+                {!isCustomBg && <span className="absolute inset-0 flex items-center justify-center text-[9px] font-mono text-secondary pointer-events-none">+</span>}
+                <input type="color" value={bgColor ?? '#3a3a3c'} onFocus={() => pushHistory()} onChange={e => setBgColor(e.target.value)}
+                  className="absolute -inset-2 w-12 h-12 cursor-pointer opacity-0" />
+              </label>
+            </div>
+          </div>
+          <button onClick={() => setShowBounds(v => !v)}
+            className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
+            <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${showBounds ? 'bg-accent border-accent' : 'border-border'}`}>
+              {showBounds && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
+            </span>
+            Show canvas bounds
+          </button>
+        </div>
+
+        {/* Active layer properties */}
+        {active && (
+          <div className="border-b border-border px-4 py-4 space-y-4">
+            <PropSlider label="Opacity" value={Math.round(active.opacity * 100)} min={0} max={100} suffix="%"
+              onStart={pushHistory}
+              onChange={v => patchLayer(active.id, { opacity: v / 100 })} />
+            <PropSlider label="Scale" value={Math.round(active.scale * 100)} min={1} max={400} suffix="%"
+              onStart={pushHistory}
+              onChange={v => {
+                // Scale about the layer center to keep it anchored.
+                const img = imagesRef.current.get(active.id)!;
+                const oldW = img.naturalWidth * active.scale, oldH = img.naturalHeight * active.scale;
+                const newScale = v / 100;
+                const newW = img.naturalWidth * newScale, newH = img.naturalHeight * newScale;
+                patchLayer(active.id, { scale: newScale, x: active.x + (oldW - newW) / 2, y: active.y + (oldH - newH) / 2 });
+              }} />
+            <PropSlider label="Rotate" value={Math.round(active.rotation)} min={-180} max={180} suffix="°"
+              icon={<RotateCw size={12} className="text-secondary" />}
+              onStart={pushHistory}
+              onChange={v => patchLayer(active.id, { rotation: v })} />
+
+            <div className="flex flex-wrap gap-2 pt-1">
+              <MiniBtn onClick={() => resetTransform(active.id)}>Fit</MiniBtn>
+              <MiniBtn onClick={() => fillDoc(active.id)}>Fill</MiniBtn>
+              <MiniBtn onClick={() => invertMask(active.id)}>Invert mask</MiniBtn>
+              <MiniBtn onClick={() => clearMask(active.id)}>Reset mask</MiniBtn>
+            </div>
+          </div>
+        )}
+
+        {/* Layer list (top layer first) */}
+        <div className="flex-1 overflow-y-auto">
+          {[...layers].reverse().map(layer => (
+            <LayerRow
+              key={layer.id}
+              layer={layer}
+              img={imagesRef.current.get(layer.id)}
+              active={layer.id === activeId}
+              onSelect={() => setActiveId(layer.id)}
+              onToggle={() => patchLayer(layer.id, { visible: !layer.visible })}
+              onUp={() => moveLayer(layer.id, 1)}
+              onDown={() => moveLayer(layer.id, -1)}
+              onDelete={() => removeLayer(layer.id)}
+            />
+          ))}
+          {layers.length === 0 && (
+            <div className="p-6 text-center text-secondary text-xs font-mono">No layers yet</div>
+          )}
+        </div>
+
+        {/* Shared project assets — reusable across every tab */}
+        {assets.length > 0 && (
+          <div className="shrink-0 border-t border-border px-3 py-3">
+            <div className="flex items-center gap-1.5 text-secondary mb-2">
+              <ImagePlus size={12} className="text-accent" />
+              <span className="font-mono text-[10px] uppercase tracking-widest">Project Assets</span>
+              <span className="ml-auto font-mono text-[10px] text-secondary">{assets.length}</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
+              {assets.map(a => (
+                <button key={a.id} onClick={() => addLayerFromAsset(a.id)}
+                  title={`Add "${a.name}" to this tab`}
+                  className="relative w-11 h-11 rounded border border-border overflow-hidden hover:border-accent group">
+                  <AssetThumb img={assetsRef.current.get(a.id)?.img} />
+                  <span className="absolute inset-0 flex items-center justify-center bg-accent/70 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Plus size={16} className="text-white" />
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      </div>
+
+      {/* fal API key modal */}
+      {keyModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6" onClick={() => setKeyModalOpen(false)}>
+          <div className="bg-background border border-border rounded-2xl shadow-elevated w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <KeyRound size={16} className="text-accent" />
+                <h3 className="font-serif text-xl text-primary">Connect fal</h3>
+              </div>
+              <button onClick={() => setKeyModalOpen(false)} className="text-secondary hover:text-primary"><X size={18} /></button>
+            </div>
+            <p className="text-xs text-secondary leading-relaxed mb-4">
+              Smart Select runs Meta SAM 3 on fal (~$0.005 per select). Paste your fal API key — it's stored only in this browser and sent directly to fal.
+            </p>
+            <input
+              type="password"
+              value={keyInput}
+              onChange={e => setKeyInput(e.target.value)}
+              placeholder="fal API key (key_...)"
+              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-primary placeholder:text-secondary/60 focus:outline-none focus:border-accent mb-4"
+              autoFocus
+            />
+            <div className="flex items-center justify-between">
+              <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noreferrer" className="text-[11px] font-mono text-secondary hover:text-accent">get a key ↗</a>
+              <div className="flex gap-2">
+                {hasFalKey() && (
+                  <button onClick={() => { setFalKey(''); setKeyInput(''); }}
+                    className="text-xs px-3 py-2 rounded-lg border border-border text-secondary hover:text-primary">Clear</button>
+                )}
+                <button onClick={() => { setFalKey(keyInput); setKeyModalOpen(false); setSelectMsg(null); }}
+                  disabled={!keyInput.trim()}
+                  className="text-xs px-4 py-2 rounded-lg bg-accent text-white font-medium disabled:opacity-40">Save key</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- Small UI pieces ---
+const ToolBtn = ({ icon, label, active, onClick }: any) => (
+  <button onClick={onClick} title={label}
+    className={`group relative w-10 h-10 rounded-lg flex items-center justify-center transition-colors ${active ? 'bg-accentDim text-accent' : 'text-secondary hover:text-primary hover:bg-surface'}`}>
+    {icon}
+    <span className="absolute left-12 px-2 py-1 bg-inverse text-inverseText text-[10px] rounded opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50 shadow-lg">{label}</span>
+  </button>
+);
+
+const SegBtn = ({ active, onClick, icon, children }: any) => (
+  <button onClick={onClick}
+    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${active ? 'bg-background text-primary shadow-sm' : 'text-secondary hover:text-primary'}`}>
+    {icon}{children}
+  </button>
+);
+
+const Slider = ({ label, value, min, max, step = 1, onChange, suffix = '', w = 90 }: any) => (
+  <div className="flex items-center gap-2">
+    <span className="text-[10px] font-mono uppercase tracking-wide text-secondary">{label}</span>
+    <input type="range" min={min} max={max} step={step} value={value}
+      onChange={e => onChange(Number(e.target.value))}
+      className="accent-accent" style={{ width: w }} />
+    <span className="text-[10px] font-mono text-primary w-10 tabular-nums">{value}{suffix}</span>
+  </div>
+);
+
+const PropSlider = ({ label, value, min, max, onChange, onStart, suffix = '', icon }: any) => (
+  <div>
+    <div className="flex items-center justify-between mb-1">
+      <span className="text-[10px] font-mono uppercase tracking-wide text-secondary flex items-center gap-1">{icon}{label}</span>
+      <span className="text-[10px] font-mono text-primary tabular-nums">{value}{suffix}</span>
+    </div>
+    <input type="range" min={min} max={max} value={value}
+      onPointerDown={onStart}
+      onChange={e => onChange(Number(e.target.value))}
+      className="w-full accent-accent" />
+  </div>
+);
+
+const AssetThumb = ({ img }: { img?: HTMLImageElement }) => (
+  <span className="block w-full h-full bg-black/20">
+    {img && <img src={img.src} alt="" className="w-full h-full object-cover" draggable={false} />}
+  </span>
+);
+
+const MiniBtn = ({ children, onClick }: any) => (
+  <button onClick={onClick}
+    className="text-[10px] font-mono uppercase tracking-wide px-2 py-1 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors">
+    {children}
+  </button>
+);
+
+const LayerRow = ({ layer, img, active, onSelect, onToggle, onUp, onDown, onDelete }: any) => {
+  const thumbRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const cv = thumbRef.current;
+    if (!cv || !img) return;
+    const ctx = cv.getContext('2d')!;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const s = Math.min(cv.width / img.naturalWidth, cv.height / img.naturalHeight);
+    const w = img.naturalWidth * s, h = img.naturalHeight * s;
+    ctx.drawImage(img, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
+  }, [img]);
+  return (
+    <div onClick={onSelect}
+      className={`flex items-center gap-2.5 px-3 py-2.5 cursor-pointer border-l-2 transition-colors ${active ? 'border-accent bg-accentDim/40' : 'border-transparent hover:bg-surface'}`}>
+      <button onClick={e => { e.stopPropagation(); onToggle(); }} className="text-secondary hover:text-primary shrink-0">
+        {layer.visible ? <Eye size={15} /> : <EyeOff size={15} />}
+      </button>
+      <canvas ref={thumbRef} width={40} height={40}
+        className="w-10 h-10 rounded bg-black/20 shrink-0 border border-border" />
+      <div className="flex-1 min-w-0">
+        <div className={`text-xs truncate ${layer.visible ? 'text-primary' : 'text-secondary'}`}>{layer.name}</div>
+        <div className="text-[9px] font-mono text-secondary">{Math.round(layer.opacity * 100)}%</div>
+      </div>
+      <div className="flex flex-col shrink-0">
+        <button onClick={e => { e.stopPropagation(); onUp(); }} className="text-secondary hover:text-primary"><ArrowUp size={12} /></button>
+        <button onClick={e => { e.stopPropagation(); onDown(); }} className="text-secondary hover:text-primary"><ArrowDown size={12} /></button>
+      </div>
+      <button onClick={e => { e.stopPropagation(); onDelete(); }} className="text-secondary hover:text-accent shrink-0"><Trash2 size={14} /></button>
+    </div>
+  );
+};
+
+export default LayerStudioView;
