@@ -46,6 +46,7 @@ const EXPORT_LONG_EDGE = 2048; // 2K export long edge
 const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
 
 const ASPECTS: { label: string; w: number; h: number }[] = [
+  { label: '21:9', w: 21, h: 9 },
   { label: '16:9', w: 16, h: 9 },
   { label: '9:16', w: 9, h: 16 },
   { label: '1:1', w: 1, h: 1 },
