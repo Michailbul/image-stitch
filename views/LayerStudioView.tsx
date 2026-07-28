@@ -1,6 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { sam3Segment, fluxFill, getFalKey, setFalKey, hasFalKey } from '../utils/fal';
-import { saveProject, loadProject, PersistedProject, PersistedTab } from '../utils/layerStudioStore';
+import {
+  saveProject, loadProject, loadWorkspace, saveWorkspace, deleteProject,
+  PersistedProject, PersistedTab, ProjectMeta,
+} from '../utils/layerStudioStore';
 import {
   Upload,
   Move,
@@ -30,6 +33,11 @@ import {
   ImagePlus,
   Crop,
   Sparkles,
+  GripVertical,
+  ChevronDown,
+  ChevronRight,
+  FolderOpen,
+  Pencil,
 } from 'lucide-react';
 
 // --- Config ---
@@ -68,6 +76,21 @@ type MaskMode = 'hide' | 'reveal';
 const MAX_ZOOM = 16;      // hard upper bound
 const MIN_ZOOM_FIT = 0.5; // can't zoom out below this fraction of the fit scale
 const PAN_MARGIN = 140;   // px of empty space allowed beyond the artboard edges
+
+// Right-hand layers panel: drag-resizable width, remembered across sessions.
+const PANEL_MIN = 240;
+const PANEL_MAX = 620;
+const PANEL_DEFAULT = 288;
+const PANEL_W_KEY = 'ls-panel-w';
+const readPanelW = () => {
+  const n = Number(localStorage.getItem(PANEL_W_KEY));
+  return Number.isFinite(n) && n >= PANEL_MIN && n <= PANEL_MAX ? n : PANEL_DEFAULT;
+};
+
+// Which panel sections are open — remembered so the list keeps the height the
+// user gave it across reloads.
+const readOpen = (key: string) => localStorage.getItem(`ls-open-${key}`) !== '0';
+const writeOpen = (key: string, open: boolean) => localStorage.setItem(`ls-open-${key}`, open ? '1' : '0');
 
 /** Undo/redo snapshot of the whole editable state. Masks are stored as data URLs. */
 interface Snapshot {
@@ -132,6 +155,36 @@ const LayerStudioView: React.FC = () => {
   // state is authoritative and flushed here on save/switch).
   const tabDocsRef = useRef<Map<string, PersistedTab>>(new Map());
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+
+  // --- Workspace: many named projects, each with its own tabs + assets ---
+  const [projects, setProjects] = useState<ProjectMeta[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState('Project 1');
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const activeProjectIdRef = useRef<string | null>(null);
+  activeProjectIdRef.current = activeProjectId;
+  const projectNameRef = useRef(projectName);
+  projectNameRef.current = projectName;
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [renamingProject, setRenamingProject] = useState(false);
+  const [switchingProject, setSwitchingProject] = useState(false);
+
+  // --- Layers panel chrome: resizable width + collapsible sections ---
+  const [panelW, setPanelW] = useState(readPanelW);
+  const panelWRef = useRef(panelW);
+  panelWRef.current = panelW;
+  const panelResizeRef = useRef<{ x: number; w: number } | null>(null);
+  const [showArtboard, setShowArtboard] = useState(() => readOpen('artboard'));
+  const [showProps, setShowProps] = useState(() => readOpen('props'));
+  const [showAssets, setShowAssets] = useState(() => readOpen('assets'));
+  const toggleSection = (key: string, set: React.Dispatch<React.SetStateAction<boolean>>) =>
+    set(v => { writeOpen(key, !v); return !v; });
+
+  // --- Layer list interaction: rename + drag-to-reorder ---
+  const [renamingLayerId, setRenamingLayerId] = useState<string | null>(null);
+  const [dragLayerId, setDragLayerId] = useState<string | null>(null);
+  const [dropHint, setDropHint] = useState<{ id: string; before: boolean } | null>(null);
 
   // --- Tools ---
   const [tool, setTool] = useState<Tool>('move');
@@ -935,7 +988,14 @@ const LayerStudioView: React.FC = () => {
     const assetsObj: PersistedProject['assets'] = {};
     assetsRef.current.forEach((a, id) => { assetsObj[id] = { name: a.name, w: a.w, h: a.h, dataUrl: a.dataUrl }; });
     const tabs = tabsMetaRef.current.map(m => tabDocsRef.current.get(m.id)).filter(Boolean) as PersistedTab[];
-    return { v: 2, activeTabId: activeTabIdRef.current, assets: assetsObj, tabs };
+    return {
+      v: 3,
+      id: activeProjectIdRef.current || newUUID(),
+      name: projectNameRef.current,
+      activeTabId: activeTabIdRef.current,
+      assets: assetsObj,
+      tabs,
+    };
   };
 
   const markDirty = () => {
@@ -946,21 +1006,18 @@ const LayerStudioView: React.FC = () => {
     }, 800);
   };
 
-  const hydrate = async () => {
-    const proj = await loadProject();
-    if (!proj || !proj.tabs.length) {
-      // Fresh project: one empty tab.
-      const doc = emptyTabDoc('Tab 1');
-      tabDocsRef.current.set(doc.id, doc);
-      setTabsMeta([{ id: doc.id, name: doc.name }]);
-      setActiveTabId(doc.id); activeTabIdRef.current = doc.id;
-      hydratingRef.current = false;
-      return;
-    }
-    // Rebuild shared assets.
+  /** Write the active project immediately (before switching away from it). */
+  const flushNow = async () => {
+    if (saveTimerRef.current) { window.clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
+    if (hydratingRef.current || !activeProjectIdRef.current) return;
+    try { await saveProject(captureProject()); } catch { /* ignore quota/errors */ }
+  };
+
+  /** Load a project's assets + tabs into the live editing state. */
+  const openProjectDoc = async (proj: PersistedProject) => {
     const amap = new Map<string, { name: string; w: number; h: number; img: HTMLImageElement; dataUrl: string }>();
     const alist: ProjectAsset[] = [];
-    await Promise.all(Object.entries(proj.assets).map(async ([id, a]) => {
+    await Promise.all(Object.entries(proj.assets || {}).map(async ([id, a]) => {
       try {
         const img = await loadImageEl(a.dataUrl);
         amap.set(id, { name: a.name, w: a.w || img.naturalWidth, h: a.h || img.naturalHeight, img, dataUrl: a.dataUrl });
@@ -969,17 +1026,127 @@ const LayerStudioView: React.FC = () => {
     }));
     assetsRef.current = amap;
     setAssets(alist);
-    proj.tabs.forEach(t => tabDocsRef.current.set(t.id, t));
-    setTabsMeta(proj.tabs.map(t => ({ id: t.id, name: t.name })));
-    const activeId = proj.tabs.some(t => t.id === proj.activeTabId) ? proj.activeTabId! : proj.tabs[0].id;
-    setActiveTabId(activeId); activeTabIdRef.current = activeId;
-    await loadTabDoc(tabDocsRef.current.get(activeId)!);
+
+    setActiveProjectId(proj.id); activeProjectIdRef.current = proj.id;
+    setProjectName(proj.name); projectNameRef.current = proj.name;
+
+    tabDocsRef.current = new Map();
+    const tabs = proj.tabs.length ? proj.tabs : [emptyTabDoc('Tab 1')];
+    tabs.forEach(t => tabDocsRef.current.set(t.id, t));
+    setTabsMeta(tabs.map(t => ({ id: t.id, name: t.name })));
+    tabsMetaRef.current = tabs.map(t => ({ id: t.id, name: t.name }));
+    const tabId = tabs.some(t => t.id === proj.activeTabId) ? proj.activeTabId! : tabs[0].id;
+    setActiveTabId(tabId); activeTabIdRef.current = tabId;
+    await loadTabDoc(tabDocsRef.current.get(tabId)!);
+  };
+
+  const blankProject = (name: string): PersistedProject => {
+    const doc = emptyTabDoc('Tab 1');
+    return { v: 3, id: newUUID(), name, activeTabId: doc.id, assets: {}, tabs: [doc] };
+  };
+
+  const hydrate = async () => {
+    const ws = await loadWorkspace();
+    if (!ws.projects.length) {
+      const proj = blankProject('Project 1');
+      setProjects([{ id: proj.id, name: proj.name, updatedAt: Date.now() }]);
+      await openProjectDoc(proj);
+      hydratingRef.current = false;
+      markDirty();
+      return;
+    }
+    setProjects(ws.projects);
+    projectsRef.current = ws.projects;
+    const wantId = ws.projects.some(p => p.id === ws.activeProjectId) ? ws.activeProjectId! : ws.projects[0].id;
+    const proj = (await loadProject(wantId)) || blankProject(ws.projects.find(p => p.id === wantId)?.name || 'Project 1');
+    await openProjectDoc(proj);
     hydratingRef.current = false;
   };
 
   useEffect(() => { hydrate(); /* eslint-disable-next-line */ }, []);
   // Autosave when persisted state changes; mask-pixel edits call markDirty directly.
-  useEffect(() => { markDirty(); /* eslint-disable-next-line */ }, [layers, bgColor, showBounds, docW, docH, aspect, activeId, tabsMeta, activeTabId, assets]);
+  useEffect(() => { markDirty(); /* eslint-disable-next-line */ }, [layers, bgColor, showBounds, docW, docH, aspect, activeId, tabsMeta, activeTabId, assets, projectName]);
+
+  // ---------------------------------------------------------------------------
+  // Projects — a project owns its tabs and its shared asset pool
+  // ---------------------------------------------------------------------------
+  const persistProjectList = (list: ProjectMeta[], activeId: string | null) => {
+    setProjects(list);
+    projectsRef.current = list;
+    saveWorkspace({ v: 3, activeProjectId: activeId, projects: list }).catch(() => { /* ignore */ });
+  };
+
+  const switchProject = async (id: string) => {
+    if (id === activeProjectIdRef.current) { setProjectMenuOpen(false); return; }
+    setProjectMenuOpen(false);
+    setSwitchingProject(true);
+    try {
+      await flushNow();
+      hydratingRef.current = true; // don't autosave the in-between state
+      const proj = (await loadProject(id)) || blankProject(projectsRef.current.find(p => p.id === id)?.name || 'Project');
+      await openProjectDoc(proj);
+      persistProjectList(projectsRef.current, id);
+    } finally {
+      hydratingRef.current = false;
+      setSwitchingProject(false);
+    }
+  };
+
+  const newProject = async () => {
+    setProjectMenuOpen(false);
+    setSwitchingProject(true);
+    try {
+      await flushNow();
+      hydratingRef.current = true;
+      const proj = blankProject(`Project ${projectsRef.current.length + 1}`);
+      await openProjectDoc(proj);
+      const list = [...projectsRef.current, { id: proj.id, name: proj.name, updatedAt: Date.now() }];
+      persistProjectList(list, proj.id);
+    } finally {
+      hydratingRef.current = false;
+      setSwitchingProject(false);
+    }
+    // Write the (empty) project record now so the index never points at nothing.
+    saveProject(captureProject()).catch(() => { /* ignore */ });
+  };
+
+  const renameProject = (name: string) => {
+    const clean = name.trim();
+    if (!clean) return;
+    const id = activeProjectIdRef.current;
+    setProjectName(clean); projectNameRef.current = clean;
+    persistProjectList(projectsRef.current.map(p => (p.id === id ? { ...p, name: clean } : p)), id);
+    markDirty();
+  };
+
+  const removeProject = async (id: string) => {
+    const meta = projectsRef.current.find(p => p.id === id);
+    if (!meta) return;
+    if (!window.confirm(`Delete project "${meta.name}"? Its tabs, layers and assets are removed for good.`)) return;
+    const remaining = projectsRef.current.filter(p => p.id !== id);
+    await deleteProject(id).catch(() => { /* ignore */ });
+    if (id !== activeProjectIdRef.current) {
+      persistProjectList(remaining, activeProjectIdRef.current);
+      return;
+    }
+    setSwitchingProject(true);
+    try {
+      hydratingRef.current = true;
+      if (!remaining.length) {
+        const proj = blankProject('Project 1');
+        await openProjectDoc(proj);
+        persistProjectList([{ id: proj.id, name: proj.name, updatedAt: Date.now() }], proj.id);
+      } else {
+        const proj = (await loadProject(remaining[0].id)) || blankProject(remaining[0].name);
+        await openProjectDoc(proj);
+        persistProjectList(remaining, remaining[0].id);
+      }
+    } finally {
+      hydratingRef.current = false;
+      setSwitchingProject(false);
+    }
+    markDirty();
+  };
 
   // ---------------------------------------------------------------------------
   // Undo / redo
@@ -1269,6 +1436,33 @@ const LayerStudioView: React.FC = () => {
     });
   };
 
+  const renameLayer = (id: string, name: string) => {
+    const clean = name.trim().slice(0, 60);
+    if (!clean) return;
+    pushHistory();
+    patchLayer(id, { name: clean });
+  };
+
+  /**
+   * Drop `dragId` next to `targetId` in the *panel* order (top layer first),
+   * then flip back to the stored order (bottom layer first). Masks and images
+   * are keyed by layer id, so only the array order moves.
+   */
+  const reorderLayer = (dragId: string, targetId: string, before: boolean) => {
+    if (dragId === targetId) return;
+    pushHistory();
+    setLayers(prev => {
+      const display = [...prev].reverse();
+      const from = display.findIndex(l => l.id === dragId);
+      if (from < 0) return prev;
+      const [moved] = display.splice(from, 1);
+      const ti = display.findIndex(l => l.id === targetId);
+      if (ti < 0) return prev;
+      display.splice(before ? ti : ti + 1, 0, moved);
+      return display.reverse();
+    });
+  };
+
   const clearMask = (id: string) => {
     const mask = masksRef.current.get(id);
     if (!mask) return;
@@ -1440,6 +1634,66 @@ const LayerStudioView: React.FC = () => {
   // ---------------------------------------------------------------------------
   return (
     <div className="w-full h-full flex flex-col bg-background text-primary select-none">
+      {/* Project bar — the project owns its tabs and its shared asset pool */}
+      <div className="h-9 shrink-0 border-b border-border flex items-center gap-2 px-3 relative">
+        <FolderOpen size={13} className="text-accent shrink-0" />
+        {renamingProject ? (
+          <input
+            autoFocus
+            defaultValue={projectName}
+            onBlur={e => { renameProject(e.target.value); setRenamingProject(false); }}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { renameProject((e.target as HTMLInputElement).value); setRenamingProject(false); }
+              if (e.key === 'Escape') setRenamingProject(false);
+            }}
+            className="bg-surface border border-accent rounded px-1.5 py-0.5 text-xs w-48 focus:outline-none"
+          />
+        ) : (
+          <>
+            <button onClick={() => setProjectMenuOpen(v => !v)}
+              className="flex items-center gap-1.5 text-xs text-primary hover:text-accent transition-colors max-w-[240px]"
+              title="Switch project">
+              <span className="truncate">{projectName}</span>
+              <ChevronDown size={12} className="text-secondary shrink-0" />
+            </button>
+            <button onClick={() => setRenamingProject(true)}
+              className="text-secondary hover:text-primary shrink-0" title="Rename project">
+              <Pencil size={11} />
+            </button>
+          </>
+        )}
+        <span className="ml-auto font-mono text-[9px] uppercase tracking-widest text-secondary">
+          {tabsMeta.length} {tabsMeta.length === 1 ? 'tab' : 'tabs'} · {assets.length} {assets.length === 1 ? 'asset' : 'assets'}
+        </span>
+
+        {projectMenuOpen && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setProjectMenuOpen(false)} />
+            <div className="absolute left-2 top-9 z-50 w-72 bg-background border border-border rounded-lg shadow-elevated py-1">
+              <div className="px-3 py-1.5 font-mono text-[9px] uppercase tracking-widest text-secondary">Projects</div>
+              <div className="max-h-72 overflow-y-auto">
+                {projects.map(p => (
+                  <div key={p.id}
+                    className={`group flex items-center gap-2 px-3 py-1.5 cursor-pointer border-l-2 ${p.id === activeProjectId ? 'border-accent text-primary' : 'border-transparent text-secondary hover:text-primary hover:bg-surface'}`}
+                    onClick={() => switchProject(p.id)}>
+                    <span className="text-xs truncate flex-1">{p.id === activeProjectId ? projectName : p.name}</span>
+                    <button onClick={e => { e.stopPropagation(); removeProject(p.id); }}
+                      className="opacity-0 group-hover:opacity-100 text-secondary hover:text-accent shrink-0" title="Delete project">
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="h-px bg-border my-1" />
+              <button onClick={newProject}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-secondary hover:text-primary hover:bg-surface">
+                <Plus size={12} /> New project
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
       {/* Tab bar */}
       <div className="h-9 shrink-0 border-b border-border flex items-stretch pl-2 pr-1 gap-0.5 overflow-x-auto no-scrollbar">
         {tabsMeta.map(t => {
@@ -1459,7 +1713,7 @@ const LayerStudioView: React.FC = () => {
                   className="bg-surface border border-accent rounded px-1 text-xs w-24 focus:outline-none"
                 />
               ) : (
-                <span className="text-xs truncate">{t.name}</span>
+                <span className="text-xs truncate" title={`${t.name} — double-click to rename`}>{t.name}</span>
               )}
               <button
                 onClick={e => { e.stopPropagation(); closeTab(t.id); }}
@@ -1641,6 +1895,16 @@ const LayerStudioView: React.FC = () => {
             <button onClick={() => zoomBy(1.2)} className="w-6 h-6 flex items-center justify-center text-secondary hover:text-primary rounded" title="Zoom in (+)">+</button>
           </div>
 
+          {/* Project switch overlay — assets and masks are re-decoded on load */}
+          {switchingProject && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/60 backdrop-blur-[1px] pointer-events-none">
+              <div className="flex items-center gap-3 bg-background border border-border rounded-full px-5 py-3 shadow-elevated">
+                <Loader2 size={18} className="animate-spin text-accent" />
+                <span className="font-serif text-base text-primary">Opening project…</span>
+              </div>
+            </div>
+          )}
+
           {/* Smart Select working overlay */}
           {(selecting || busyMsg) && (
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 backdrop-blur-[1px] pointer-events-none">
@@ -1653,8 +1917,24 @@ const LayerStudioView: React.FC = () => {
         </div>
       </div>
 
-      {/* Layers panel */}
-      <div className="w-72 shrink-0 border-l border-border flex flex-col">
+      {/* Layers panel — drag the left edge to resize */}
+      <div
+        onPointerDown={e => { (e.target as HTMLElement).setPointerCapture?.(e.pointerId); panelResizeRef.current = { x: e.clientX, w: panelWRef.current }; }}
+        onPointerMove={e => {
+          const st = panelResizeRef.current;
+          if (!st) return;
+          setPanelW(Math.max(PANEL_MIN, Math.min(PANEL_MAX, st.w - (e.clientX - st.x))));
+        }}
+        onPointerUp={() => {
+          if (!panelResizeRef.current) return;
+          panelResizeRef.current = null;
+          localStorage.setItem(PANEL_W_KEY, String(panelWRef.current));
+        }}
+        onDoubleClick={() => { setPanelW(PANEL_DEFAULT); localStorage.setItem(PANEL_W_KEY, String(PANEL_DEFAULT)); }}
+        title="Drag to resize · double-click to reset"
+        className="w-1.5 shrink-0 cursor-col-resize bg-border/40 hover:bg-accent/60 transition-colors"
+      />
+      <div className="shrink-0 border-l border-border flex flex-col min-h-0" style={{ width: panelW }}>
         <div className="h-14 shrink-0 border-b border-border flex items-center justify-between px-4">
           <span className="font-mono text-[10px] uppercase tracking-widest text-secondary">Layers</span>
           <button onClick={() => fileInputRef.current?.click()}
@@ -1664,12 +1944,11 @@ const LayerStudioView: React.FC = () => {
         </div>
 
         {/* Artboard settings */}
-        <div className="border-b border-border px-4 py-4 space-y-3">
-          <div className="flex items-center gap-1.5 text-secondary">
-            <Frame size={12} className="text-accent" />
-            <span className="font-mono text-[10px] uppercase tracking-widest">Artboard</span>
-            <span className="ml-auto font-mono text-[10px] text-primary tabular-nums">{docW}×{docH}</span>
-          </div>
+        <div className="border-b border-border shrink-0">
+          <SectionHead icon={<Frame size={12} className="text-accent" />} title="Artboard" open={showArtboard}
+            onToggle={() => toggleSection('artboard', setShowArtboard)} right={`${docW}×${docH}`} />
+        {showArtboard && (
+        <div className="px-4 pb-4 space-y-3">
           <div className="grid grid-cols-4 gap-1.5">
             {ASPECTS.map(a => (
               <button key={a.label} onClick={() => applyAspect(a.w, a.h)}
@@ -1711,10 +1990,16 @@ const LayerStudioView: React.FC = () => {
             Show canvas bounds
           </button>
         </div>
+        )}
+        </div>
 
         {/* Active layer properties */}
         {active && (
-          <div className="border-b border-border px-4 py-4 space-y-4">
+          <div className="border-b border-border shrink-0">
+          <SectionHead icon={<Move size={12} className="text-accent" />} title="Properties" open={showProps}
+            onToggle={() => toggleSection('props', setShowProps)} right={active.name} />
+          {showProps && (
+          <div className="px-4 pb-4 space-y-4">
             <PropSlider label="Opacity" value={Math.round(active.opacity * 100)} min={0} max={100} suffix="%"
               onStart={pushHistory}
               onChange={v => patchLayer(active.id, { opacity: v / 100 })} />
@@ -1740,21 +2025,55 @@ const LayerStudioView: React.FC = () => {
               <MiniBtn onClick={() => clearMask(active.id)}>Reset mask</MiniBtn>
             </div>
           </div>
+          )}
+          </div>
         )}
 
-        {/* Layer list (top layer first) */}
-        <div className="flex-1 overflow-y-auto">
-          {[...layers].reverse().map(layer => (
+        {/* Layer list (top layer first) — drag rows to restack */}
+        <div className="shrink-0 flex items-center gap-1.5 px-4 py-2 border-b border-border text-secondary">
+          <LayersIcon size={12} className="text-accent" />
+          <span className="font-mono text-[10px] uppercase tracking-widest">Stack</span>
+          <span className="ml-auto font-mono text-[9px] text-secondary/70">
+            {layers.length ? 'drag to restack' : ''}
+          </span>
+        </div>
+        <div
+          className="flex-1 min-h-[80px] overflow-y-auto"
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => {
+            e.preventDefault();
+            if (dragLayerId && dropHint) reorderLayer(dragLayerId, dropHint.id, dropHint.before);
+            setDragLayerId(null); setDropHint(null);
+          }}
+        >
+          {[...layers].reverse().map((layer, i) => (
             <LayerRow
               key={layer.id}
               layer={layer}
+              index={i}
               img={imagesRef.current.get(layer.id)}
               active={layer.id === activeId}
+              renaming={renamingLayerId === layer.id}
+              dragging={dragLayerId === layer.id}
+              hint={dropHint?.id === layer.id ? (dropHint.before ? 'before' : 'after') : null}
               onSelect={() => setActiveId(layer.id)}
               onToggle={() => patchLayer(layer.id, { visible: !layer.visible })}
               onUp={() => moveLayer(layer.id, 1)}
               onDown={() => moveLayer(layer.id, -1)}
               onDelete={() => removeLayer(layer.id)}
+              onRenameStart={() => setRenamingLayerId(layer.id)}
+              onRenameCommit={(v: string) => { renameLayer(layer.id, v); setRenamingLayerId(null); }}
+              onRenameCancel={() => setRenamingLayerId(null)}
+              onDragStart={() => setDragLayerId(layer.id)}
+              onDragOverRow={(before: boolean) => {
+                if (!dragLayerId || dragLayerId === layer.id) return;
+                setDropHint(prev => (prev?.id === layer.id && prev.before === before ? prev : { id: layer.id, before }));
+              }}
+              onDragEnd={() => { setDragLayerId(null); setDropHint(null); }}
+              onDropRow={() => {
+                if (dragLayerId && dropHint) reorderLayer(dragLayerId, dropHint.id, dropHint.before);
+                setDragLayerId(null); setDropHint(null);
+              }}
             />
           ))}
           {layers.length === 0 && (
@@ -1762,26 +2081,25 @@ const LayerStudioView: React.FC = () => {
           )}
         </div>
 
-        {/* Shared project assets — reusable across every tab */}
+        {/* Shared project assets — reusable across every tab in this project */}
         {assets.length > 0 && (
-          <div className="shrink-0 border-t border-border px-3 py-3">
-            <div className="flex items-center gap-1.5 text-secondary mb-2">
-              <ImagePlus size={12} className="text-accent" />
-              <span className="font-mono text-[10px] uppercase tracking-widest">Project Assets</span>
-              <span className="ml-auto font-mono text-[10px] text-secondary">{assets.length}</span>
-            </div>
-            <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
-              {assets.map(a => (
-                <button key={a.id} onClick={() => addLayerFromAsset(a.id)}
-                  title={`Add "${a.name}" to this tab`}
-                  className="relative w-11 h-11 rounded border border-border overflow-hidden hover:border-accent group">
-                  <AssetThumb img={assetsRef.current.get(a.id)?.img} />
-                  <span className="absolute inset-0 flex items-center justify-center bg-accent/70 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <Plus size={16} className="text-white" />
-                  </span>
-                </button>
-              ))}
-            </div>
+          <div className="shrink-0 border-t border-border">
+            <SectionHead icon={<ImagePlus size={12} className="text-accent" />} title="Project Assets" open={showAssets}
+              onToggle={() => toggleSection('assets', setShowAssets)} right={String(assets.length)} />
+            {showAssets && (
+              <div className="flex flex-wrap gap-1.5 px-3 pb-3 max-h-28 overflow-y-auto">
+                {assets.map(a => (
+                  <button key={a.id} onClick={() => addLayerFromAsset(a.id)}
+                    title={`Add "${a.name}" to this tab`}
+                    className="relative w-11 h-11 rounded border border-border overflow-hidden hover:border-accent group">
+                    <AssetThumb img={assetsRef.current.get(a.id)?.img} />
+                    <span className="absolute inset-0 flex items-center justify-center bg-accent/70 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <Plus size={16} className="text-white" />
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1880,7 +2198,23 @@ const MiniBtn = ({ children, onClick }: any) => (
   </button>
 );
 
-const LayerRow = ({ layer, img, active, onSelect, onToggle, onUp, onDown, onDelete }: any) => {
+/** Collapsible panel section header. Collapsing frees height for the layer list. */
+const SectionHead = ({ icon, title, open, onToggle, right }: any) => (
+  <button onClick={onToggle}
+    className="w-full flex items-center gap-1.5 px-4 py-2.5 text-secondary hover:text-primary transition-colors">
+    {open ? <ChevronDown size={11} className="shrink-0" /> : <ChevronRight size={11} className="shrink-0" />}
+    {icon}
+    <span className="font-mono text-[10px] uppercase tracking-widest">{title}</span>
+    {right && <span className="ml-auto font-mono text-[10px] text-primary tabular-nums truncate max-w-[45%]">{right}</span>}
+  </button>
+);
+
+const LayerRow = ({
+  layer, img, index, active, renaming, dragging, hint,
+  onSelect, onToggle, onUp, onDown, onDelete,
+  onRenameStart, onRenameCommit, onRenameCancel,
+  onDragStart, onDragOverRow, onDragEnd, onDropRow,
+}: any) => {
   const thumbRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const cv = thumbRef.current;
@@ -1892,22 +2226,56 @@ const LayerRow = ({ layer, img, active, onSelect, onToggle, onUp, onDown, onDele
     ctx.drawImage(img, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
   }, [img]);
   return (
-    <div onClick={onSelect}
-      className={`flex items-center gap-2.5 px-3 py-2.5 cursor-pointer border-l-2 transition-colors ${active ? 'border-accent bg-accentDim/40' : 'border-transparent hover:bg-surface'}`}>
+    <div
+      onClick={onSelect}
+      draggable={!renaming}
+      onDragStart={e => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', layer.id); onDragStart(); }}
+      onDragOver={e => {
+        e.preventDefault();
+        const r = e.currentTarget.getBoundingClientRect();
+        onDragOverRow(e.clientY < r.top + r.height / 2);
+      }}
+      onDragEnd={onDragEnd}
+      onDrop={e => { e.preventDefault(); e.stopPropagation(); onDropRow(); }}
+      className={`relative flex items-center gap-2 pl-1.5 pr-3 py-2.5 cursor-pointer border-l-2 transition-colors ${active ? 'border-accent bg-accentDim/40' : 'border-transparent hover:bg-surface'} ${dragging ? 'opacity-40' : ''}`}>
+      {hint === 'before' && <span className="absolute left-0 right-0 -top-px h-0.5 bg-accent pointer-events-none" />}
+      {hint === 'after' && <span className="absolute left-0 right-0 -bottom-px h-0.5 bg-accent pointer-events-none" />}
+      <GripVertical size={13} className="text-secondary/40 shrink-0 cursor-grab" />
       <button onClick={e => { e.stopPropagation(); onToggle(); }} className="text-secondary hover:text-primary shrink-0">
         {layer.visible ? <Eye size={15} /> : <EyeOff size={15} />}
       </button>
       <canvas ref={thumbRef} width={40} height={40}
         className="w-10 h-10 rounded bg-black/20 shrink-0 border border-border" />
       <div className="flex-1 min-w-0">
-        <div className={`text-xs truncate ${layer.visible ? 'text-primary' : 'text-secondary'}`}>{layer.name}</div>
-        <div className="text-[9px] font-mono text-secondary">{Math.round(layer.opacity * 100)}%</div>
+        {renaming ? (
+          <input
+            autoFocus
+            defaultValue={layer.name}
+            onClick={e => e.stopPropagation()}
+            onBlur={e => onRenameCommit(e.target.value)}
+            onKeyDown={e => {
+              e.stopPropagation();
+              if (e.key === 'Enter') onRenameCommit((e.target as HTMLInputElement).value);
+              if (e.key === 'Escape') onRenameCancel();
+            }}
+            className="w-full bg-surface border border-accent rounded px-1 py-0.5 text-xs text-primary focus:outline-none"
+          />
+        ) : (
+          <div onDoubleClick={e => { e.stopPropagation(); onRenameStart(); }}
+            title={`${layer.name} — double-click to rename`}
+            className={`text-xs truncate ${layer.visible ? 'text-primary' : 'text-secondary'}`}>
+            {layer.name}
+          </div>
+        )}
+        <div className="text-[9px] font-mono text-secondary tabular-nums">
+          {index + 1} · {Math.round(layer.opacity * 100)}%
+        </div>
       </div>
       <div className="flex flex-col shrink-0">
-        <button onClick={e => { e.stopPropagation(); onUp(); }} className="text-secondary hover:text-primary"><ArrowUp size={12} /></button>
-        <button onClick={e => { e.stopPropagation(); onDown(); }} className="text-secondary hover:text-primary"><ArrowDown size={12} /></button>
+        <button onClick={e => { e.stopPropagation(); onUp(); }} title="Move up" className="text-secondary hover:text-primary"><ArrowUp size={12} /></button>
+        <button onClick={e => { e.stopPropagation(); onDown(); }} title="Move down" className="text-secondary hover:text-primary"><ArrowDown size={12} /></button>
       </div>
-      <button onClick={e => { e.stopPropagation(); onDelete(); }} className="text-secondary hover:text-accent shrink-0"><Trash2 size={14} /></button>
+      <button onClick={e => { e.stopPropagation(); onDelete(); }} title="Delete layer" className="text-secondary hover:text-accent shrink-0"><Trash2 size={14} /></button>
     </div>
   );
 };
