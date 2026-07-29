@@ -38,6 +38,8 @@ import {
   ChevronRight,
   FolderOpen,
   Pencil,
+  Link,
+  Unlink,
 } from 'lucide-react';
 
 // --- Config ---
@@ -45,7 +47,7 @@ const DOC_LONG = 2048;         // artboard long-edge working resolution (px)
 const EXPORT_LONG_EDGE = 2048; // 2K export long edge
 const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
 
-const ASPECTS: { label: string; w: number; h: number }[] = [
+const ASPECTS: { label: string; w: number; h: number; hint?: string }[] = [
   { label: '21:9', w: 21, h: 9 },
   { label: '16:9', w: 16, h: 9 },
   { label: '9:16', w: 9, h: 16 },
@@ -56,6 +58,9 @@ const ASPECTS: { label: string; w: number; h: number }[] = [
   { label: '3:2', w: 3, h: 2 },
   { label: '2:3', w: 2, h: 3 },
   { label: '2:1', w: 2, h: 1 },
+  { label: '1:2', w: 1, h: 2 },
+  { label: '7:6', w: 7, h: 6, hint: 'two 21:9 frames stacked' },
+  { label: '14:3', w: 14, h: 3, hint: 'two 21:9 frames side by side' },
 ];
 
 const BG_SWATCHES: { label: string; value: string | null }[] = [
@@ -70,6 +75,36 @@ const dimsForAspect = (aw: number, ah: number) =>
   aw >= ah
     ? { w: DOC_LONG, h: Math.round((DOC_LONG * ah) / aw) }
     : { w: Math.round((DOC_LONG * aw) / ah), h: DOC_LONG };
+
+// Custom canvas size limits. Every layer carries a full-size mask canvas, so the
+// pixel budget matters more than either edge on its own.
+const MIN_SIDE = 64;
+const MAX_SIDE = 8192;
+const MAX_PIXELS = 4096 * 4096;
+
+/** Clamp a requested canvas size to the working limits, preserving its ratio. */
+const clampDims = (w: number, h: number) => {
+  let cw = Math.max(1, Math.round(w) || 1);
+  let ch = Math.max(1, Math.round(h) || 1);
+  // Shrink both edges by the same factor so an oversized request keeps its shape.
+  const k = Math.min(1, MAX_SIDE / Math.max(cw, ch), Math.sqrt(MAX_PIXELS / (cw * ch)));
+  if (k < 1) { cw = Math.round(cw * k); ch = Math.round(ch * k); }
+  return {
+    w: Math.min(MAX_SIDE, Math.max(MIN_SIDE, cw)),
+    h: Math.min(MAX_SIDE, Math.max(MIN_SIDE, ch)),
+  };
+};
+
+const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+/** Smallest integer ratio for a pixel size — kept on the doc for persistence. */
+const reduceRatio = (w: number, h: number) => {
+  const g = gcd(w, h) || 1;
+  return { w: Math.round(w / g), h: Math.round(h / g) };
+};
+/** A preset is "current" when the live canvas matches its ratio (rounding aside). */
+const RATIO_EPS = 0.004;
+const ratioMatches = (w: number, h: number, aw: number, ah: number) =>
+  Math.abs(w / h - aw / ah) < RATIO_EPS;
 
 type Tool = 'move' | 'mask' | 'hand' | 'eyedropper' | 'select' | 'crop';
 type MaskMode = 'hide' | 'reveal';
@@ -129,6 +164,10 @@ const LayerStudioView: React.FC = () => {
   const [aspect, setAspect] = useState<{ w: number; h: number }>({ w: 16, h: 9 });
   const [bgColor, setBgColor] = useState<string | null>(DEFAULT_BG);
   const [showBounds, setShowBounds] = useState(true);
+  // Custom canvas size: draft strings so the fields stay editable while typing.
+  const [sizeDraft, setSizeDraft] = useState({ w: String(initial.w), h: String(initial.h) });
+  const [lockRatio, setLockRatio] = useState(false);
+  const [scaleWithCanvas, setScaleWithCanvas] = useState(true);
   const bgColorRef = useRef<string | null>(DEFAULT_BG);
   bgColorRef.current = bgColor;
   const showBoundsRef = useRef(true);
@@ -341,6 +380,8 @@ const LayerStudioView: React.FC = () => {
   const docHRef = useRef(initial.h);
   useEffect(() => { docWRef.current = docW; }, [docW]);
   useEffect(() => { docHRef.current = docH; }, [docH]);
+  // Keep the size fields in step with the doc (presets, undo, tab/project switch).
+  useEffect(() => { setSizeDraft({ w: String(docW), h: String(docH) }); }, [docW, docH]);
 
   // Fit the artboard into view on mount, and re-fit until the container has a
   // real size (flex layout may not be settled when the effect first runs).
@@ -366,51 +407,115 @@ const LayerStudioView: React.FC = () => {
   // ---------------------------------------------------------------------------
   // Artboard resolution / aspect
   // ---------------------------------------------------------------------------
-  const applyAspect = (aw: number, ah: number) => {
-    const { w: nw, h: nh } = dimsForAspect(aw, ah);
+  /**
+   * Resize the artboard to an exact pixel size.
+   *
+   * Two behaviors, picked by the "Scale layers" switch:
+   *  - on  → layers and masks are rescaled with the frame (nothing jumps off
+   *          canvas; the composition is preserved, just at a new shape).
+   *  - off → Photoshop "Canvas Size": pixels keep their size and the frame grows
+   *          or crops around them, anchored at the center.
+   *
+   * `ratio` lets a preset keep its clean integer ratio (16:9 rather than the
+   * reduced form of 2048×1152).
+   */
+  const resizeDoc = (nw: number, nh: number, ratio?: { w: number; h: number }) => {
+    const { w: cw, h: ch } = clampDims(nw, nh);
     const ow = docWRef.current, oh = docHRef.current;
-    if (nw === ow && nh === oh) { setAspect({ w: aw, h: ah }); return; }
+    const ar = ratio ?? reduceRatio(cw, ch);
+    if (cw === ow && ch === oh) { setAspect(ar); return; }
     pushHistory();
-    // Rebuild each layer's mask at the new size, preserving painted content by
-    // stretching the old mask into the new canvas.
+    const scaleContent = scaleWithCanvas;
+    const dx = Math.round((cw - ow) / 2), dy = Math.round((ch - oh) / 2);
+    // Rebuild each layer's mask at the new size, preserving painted content —
+    // stretched with the frame, or re-anchored at the center when not scaling.
     masksRef.current.forEach((old, id) => {
       const next = document.createElement('canvas');
-      next.width = nw; next.height = nh;
+      next.width = cw; next.height = ch;
       const nctx = next.getContext('2d')!;
-      nctx.drawImage(old, 0, 0, nw, nh);
+      if (scaleContent) {
+        nctx.drawImage(old, 0, 0, cw, ch);
+      } else {
+        nctx.fillStyle = '#fff';           // newly exposed area starts revealed
+        nctx.fillRect(0, 0, cw, ch);
+        nctx.drawImage(old, dx, dy);
+      }
       masksRef.current.set(id, next);
     });
-    // Re-scale layer positions proportionally so nothing jumps off-canvas.
-    const rx = nw / ow, ry = nh / oh;
-    setLayers(prev => prev.map(l => {
-      const img = imagesRef.current.get(l.id);
-      if (!img) return l;
-      const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
-      const cx = (l.x + w / 2) * rx, cy = (l.y + h / 2) * ry;
-      const ns = l.scale * Math.min(rx, ry);
-      const nwd = img.naturalWidth * ns, nhd = img.naturalHeight * ns;
-      return { ...l, scale: ns, x: cx - nwd / 2, y: cy - nhd / 2 };
-    }));
-    docWRef.current = nw; docHRef.current = nh;
-    setDocW(nw); setDocH(nh);
-    setAspect({ w: aw, h: ah });
-    setTimeout(() => { fitView(nw, nh); redrawAll(); }, 0);
+    if (scaleContent) {
+      // Re-scale layer positions proportionally so nothing jumps off-canvas.
+      const rx = cw / ow, ry = ch / oh;
+      setLayers(prev => prev.map(l => {
+        const img = imagesRef.current.get(l.id);
+        if (!img) return l;
+        const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
+        const cx = (l.x + w / 2) * rx, cy = (l.y + h / 2) * ry;
+        const ns = l.scale * Math.min(rx, ry);
+        const nwd = img.naturalWidth * ns, nhd = img.naturalHeight * ns;
+        return { ...l, scale: ns, x: cx - nwd / 2, y: cy - nhd / 2 };
+      }));
+    } else {
+      setLayers(prev => prev.map(l => ({ ...l, x: l.x + dx, y: l.y + dy })));
+    }
+    docWRef.current = cw; docHRef.current = ch;
+    setDocW(cw); setDocH(ch);
+    setAspect(ar);
+    setTimeout(() => { fitView(cw, ch); redrawAll(); }, 0);
+  };
+
+  const applyAspect = (aw: number, ah: number) => {
+    const { w, h } = dimsForAspect(aw, ah);
+    resizeDoc(w, h, { w: aw, h: ah });
+  };
+
+  /** Type into a size field; with the ratio locked the other edge follows. */
+  const editSize = (edge: 'w' | 'h', raw: string) => {
+    const v = raw.replace(/[^\d]/g, '').slice(0, 5);
+    setSizeDraft(prev => {
+      const next = { ...prev, [edge]: v };
+      const n = Number(v);
+      if (lockRatio && n > 0 && docW > 0 && docH > 0) {
+        next[edge === 'w' ? 'h' : 'w'] = String(
+          Math.max(1, Math.round(edge === 'w' ? (n * docH) / docW : (n * docW) / docH)),
+        );
+      }
+      return next;
+    });
+  };
+
+  const draftDims = clampDims(Number(sizeDraft.w), Number(sizeDraft.h));
+  const sizeDirty =
+    Number(sizeDraft.w) > 0 && Number(sizeDraft.h) > 0 &&
+    (draftDims.w !== docW || draftDims.h !== docH);
+
+  const revertSize = () => setSizeDraft({ w: String(docW), h: String(docH) });
+
+  const commitSize = () => {
+    if (!sizeDirty) { revertSize(); return; }
+    resizeDoc(draftDims.w, draftDims.h);
   };
 
   // ---------------------------------------------------------------------------
   // View math
   // ---------------------------------------------------------------------------
-  /** Scale at which the artboard fits the viewport with padding. */
+  /**
+   * Scale at which the artboard fits the viewport with padding. Guards against a
+   * container that has not been laid out yet — subtracting the padding from a
+   * zero-height box would otherwise yield a negative scale and flip the view.
+   */
   const fitScaleValue = (dw = docWRef.current, dh = docHRef.current) => {
     const cont = containerRef.current;
     if (!cont || !dw || !dh) return 1;
+    const W = cont.clientWidth, H = cont.clientHeight;
+    if (W < 2 || H < 2) return viewScaleRef.current || 1;
     const pad = 64;
-    return Math.min((cont.clientWidth - pad) / dw, (cont.clientHeight - pad) / dh, 1.5);
+    return Math.max(0.01, Math.min((W - pad) / dw, (H - pad) / dh, 1.5));
   };
 
   const fitView = (dw = docWRef.current, dh = docHRef.current) => {
     const cont = containerRef.current;
     if (!cont || !dw || !dh) return;
+    if (cont.clientWidth < 2 || cont.clientHeight < 2) return; // laid out yet?
     const scale = fitScaleValue(dw, dh);
     viewScaleRef.current = scale;
     viewOffRef.current = {
@@ -1185,6 +1290,7 @@ const LayerStudioView: React.FC = () => {
   };
 
   const restoreSnapshot = async (snap: Snapshot) => {
+    const resized = snap.docW !== docWRef.current || snap.docH !== docHRef.current;
     const newMasks = new Map<string, HTMLCanvasElement>();
     await Promise.all(Object.entries(snap.masks).map(async ([id, url]) => {
       newMasks.set(id, await loadMaskCanvas(url));
@@ -1201,7 +1307,7 @@ const LayerStudioView: React.FC = () => {
     setAspect({ w: snap.aw, h: snap.ah });
     setLayers(snap.layers.map(l => ({ ...l })));
     setActiveId(snap.activeId);
-    setTimeout(() => redrawAll(), 0);
+    setTimeout(() => { if (resized) fitView(snap.docW, snap.docH); redrawAll(); }, 0);
   };
 
   const undo = async () => {
@@ -1953,10 +2059,40 @@ const LayerStudioView: React.FC = () => {
           <div className="grid grid-cols-4 gap-1.5">
             {ASPECTS.map(a => (
               <button key={a.label} onClick={() => applyAspect(a.w, a.h)}
-                className={`text-[10px] font-mono py-1.5 rounded border transition-colors ${aspect.w === a.w && aspect.h === a.h ? 'border-accent text-accent bg-accentDim' : 'border-border text-secondary hover:text-primary hover:border-accent/50'}`}>
+                title={a.hint ? `${a.label} — ${a.hint}` : a.label}
+                className={`text-[10px] font-mono py-1.5 rounded border transition-colors ${ratioMatches(docW, docH, a.w, a.h) ? 'border-accent text-accent bg-accentDim' : 'border-border text-secondary hover:text-primary hover:border-accent/50'}`}>
                 {a.label}
               </button>
             ))}
+          </div>
+
+          {/* Custom canvas size */}
+          <div>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-wide text-secondary">Size</span>
+              <button onClick={() => setLockRatio(v => !v)}
+                title={lockRatio ? 'Aspect ratio locked — the other edge follows' : 'Aspect ratio free — edges are independent'}
+                className={`flex items-center gap-1 text-[10px] font-mono uppercase tracking-wide transition-colors ${lockRatio ? 'text-accent' : 'text-secondary hover:text-primary'}`}>
+                {lockRatio ? <Link size={10} /> : <Unlink size={10} />}Lock
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5 mt-1.5">
+              <SizeField value={sizeDraft.w} onChange={v => editSize('w', v)} onCommit={commitSize} onRevert={revertSize} title="Width (px)" />
+              <span className="text-[10px] font-mono text-secondary shrink-0">×</span>
+              <SizeField value={sizeDraft.h} onChange={v => editSize('h', v)} onCommit={commitSize} onRevert={revertSize} title="Height (px)" />
+              <button onClick={commitSize} disabled={!sizeDirty}
+                className="shrink-0 text-[10px] font-mono uppercase tracking-wide px-2 py-1.5 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors disabled:opacity-30 disabled:hover:text-secondary disabled:hover:border-border">
+                Apply
+              </button>
+            </div>
+            <button onClick={() => setScaleWithCanvas(v => !v)}
+              title="On: layers rescale with the frame. Off: pixels keep their size and the frame crops or extends around them."
+              className="flex items-center gap-2 mt-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
+              <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${scaleWithCanvas ? 'bg-accent border-accent' : 'border-border'}`}>
+                {scaleWithCanvas && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
+              </span>
+              Scale layers with canvas
+            </button>
           </div>
           <div>
             <div className="flex items-center justify-between">
@@ -2184,6 +2320,20 @@ const PropSlider = ({ label, value, min, max, onChange, onStart, suffix = '', ic
       onChange={e => onChange(Number(e.target.value))}
       className="w-full accent-accent" />
   </div>
+);
+
+/** Numeric canvas-dimension field. Enter applies, Escape reverts to the doc. */
+const SizeField = ({ value, onChange, onCommit, onRevert, title }: any) => (
+  <input
+    type="text" inputMode="numeric" value={value} title={title} aria-label={title}
+    onChange={e => onChange(e.target.value)}
+    onKeyDown={e => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { (e.target as HTMLInputElement).blur(); onCommit(); }
+      if (e.key === 'Escape') { onRevert(); (e.target as HTMLInputElement).blur(); }
+    }}
+    className="min-w-0 flex-1 bg-surface border border-border rounded px-2 py-1.5 text-[10px] font-mono text-primary tabular-nums text-center focus:outline-none focus:border-accent"
+  />
 );
 
 const AssetThumb = ({ img }: { img?: HTMLImageElement }) => (
