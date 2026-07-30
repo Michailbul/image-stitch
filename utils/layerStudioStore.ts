@@ -48,6 +48,9 @@ export interface PersistedTab {
   activeId: string | null;
   layers: PersistedLayer[];
   masks: Record<string, string>; // layerId -> mask PNG data URL
+  // 'layer' = masks are stored in each layer's own pixel space (current).
+  // Absent = legacy doc-space masks, reprojected onto the layer on load.
+  maskSpace?: 'layer';
 }
 
 export interface PersistedProject {

@@ -76,11 +76,25 @@ const dimsForAspect = (aw: number, ah: number) =>
     ? { w: DOC_LONG, h: Math.round((DOC_LONG * ah) / aw) }
     : { w: Math.round((DOC_LONG * aw) / ah), h: DOC_LONG };
 
-// Custom canvas size limits. Every layer carries a full-size mask canvas, so the
-// pixel budget matters more than either edge on its own.
+// Custom canvas size limits — the pixel budget matters more than either edge on
+// its own.
 const MIN_SIDE = 64;
 const MAX_SIDE = 8192;
 const MAX_PIXELS = 4096 * 4096;
+
+// Layer masks live in the *layer's own* pixel space, not the artboard's, so a
+// mask stays glued to its image through moves, scales, rotations and canvas
+// resizes. Capped so a 60MP source doesn't allocate a 240MB mask.
+const MASK_MAX_SIDE = 4096;
+const MASK_MAX_PIXELS = 4096 * 2304;
+
+/** Mask resolution for a source image: its natural size, clamped. */
+const maskDims = (iw: number, ih: number) => {
+  const w = Math.max(1, Math.round(iw) || 1);
+  const h = Math.max(1, Math.round(ih) || 1);
+  const k = Math.min(1, MASK_MAX_SIDE / Math.max(w, h), Math.sqrt(MASK_MAX_PIXELS / (w * h)));
+  return k < 1 ? { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) } : { w, h };
+};
 
 /** Clamp a requested canvas size to the working limits, preserving its ratio. */
 const clampDims = (w: number, h: number) => {
@@ -262,7 +276,9 @@ const LayerStudioView: React.FC = () => {
   // In-progress mask stroke: accumulated on its own buffer so its feather is
   // baked only into this stroke, never re-blurring previously painted areas.
   const strokeCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const strokeInfoRef = useRef<{ layerId: string; mode: MaskMode; feather: number } | null>(null);
+  // `feather` is in mask px and `frame` is the layer geometry the stroke started
+  // on, so the whole stroke stays consistent even mid-drag.
+  const strokeInfoRef = useRef<{ layerId: string; mode: MaskMode; feather: number; frame: LayerFrame } | null>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
   const [, force] = useState(0);
@@ -312,13 +328,14 @@ const LayerStudioView: React.FC = () => {
       reader.readAsDataURL(file);
     });
 
-  // Build a fresh, fully-opaque (visible) mask at the current doc size.
-  const blankMask = (dw: number, dh: number) => {
+  // Build a fresh, fully-opaque (visible) mask in the layer's own pixel space.
+  const blankMask = (iw: number, ih: number) => {
+    const { w, h } = maskDims(iw, ih);
     const mask = document.createElement('canvas');
-    mask.width = dw; mask.height = dh;
+    mask.width = w; mask.height = h;
     const mctx = mask.getContext('2d')!;
     mctx.fillStyle = '#fff';
-    mctx.fillRect(0, 0, dw, dh);
+    mctx.fillRect(0, 0, w, h);
     return mask;
   };
 
@@ -329,7 +346,7 @@ const LayerStudioView: React.FC = () => {
     const dw = docWRef.current, dh = docHRef.current;
     const id = nextId();
     imagesRef.current.set(id, asset.img);
-    masksRef.current.set(id, blankMask(dw, dh));
+    masksRef.current.set(id, blankMask(asset.w, asset.h));
     const fit = Math.min(dw / asset.w, dh / asset.h);
     const w = asset.w * fit, h = asset.h * fit;
     const layer: CompLayer = {
@@ -361,7 +378,7 @@ const LayerStudioView: React.FC = () => {
 
       const id = nextId();
       imagesRef.current.set(id, img);
-      masksRef.current.set(id, blankMask(dw, dh));
+      masksRef.current.set(id, blankMask(img.naturalWidth, img.naturalHeight));
       const fit = Math.min(dw / img.naturalWidth, dh / img.naturalHeight);
       const w = img.naturalWidth * fit, h = img.naturalHeight * fit;
       newLayers.push({
@@ -411,10 +428,12 @@ const LayerStudioView: React.FC = () => {
    * Resize the artboard to an exact pixel size.
    *
    * Two behaviors, picked by the "Scale layers" switch:
-   *  - on  → layers and masks are rescaled with the frame (nothing jumps off
-   *          canvas; the composition is preserved, just at a new shape).
+   *  - on  → layers are rescaled with the frame (nothing jumps off canvas; the
+   *          composition is preserved, just at a new shape).
    *  - off → Photoshop "Canvas Size": pixels keep their size and the frame grows
    *          or crops around them, anchored at the center.
+   *
+   * Masks are untouched either way — they live in layer space and ride along.
    *
    * `ratio` lets a preset keep its clean integer ratio (16:9 rather than the
    * reduced form of 2048×1152).
@@ -427,21 +446,6 @@ const LayerStudioView: React.FC = () => {
     pushHistory();
     const scaleContent = scaleWithCanvas;
     const dx = Math.round((cw - ow) / 2), dy = Math.round((ch - oh) / 2);
-    // Rebuild each layer's mask at the new size, preserving painted content —
-    // stretched with the frame, or re-anchored at the center when not scaling.
-    masksRef.current.forEach((old, id) => {
-      const next = document.createElement('canvas');
-      next.width = cw; next.height = ch;
-      const nctx = next.getContext('2d')!;
-      if (scaleContent) {
-        nctx.drawImage(old, 0, 0, cw, ch);
-      } else {
-        nctx.fillStyle = '#fff';           // newly exposed area starts revealed
-        nctx.fillRect(0, 0, cw, ch);
-        nctx.drawImage(old, dx, dy);
-      }
-      masksRef.current.set(id, next);
-    });
     if (scaleContent) {
       // Re-scale layer positions proportionally so nothing jumps off-canvas.
       const rx = cw / ow, ry = ch / oh;
@@ -562,6 +566,77 @@ const LayerStudioView: React.FC = () => {
   };
 
   // ---------------------------------------------------------------------------
+  // Layer space
+  //
+  // A mask belongs to its layer, not to the artboard: it is stored at the source
+  // image's resolution and always drawn across the layer's rect. Everything the
+  // user paints therefore travels with the image when it is moved, scaled or
+  // rotated — and survives a canvas resize untouched. Doc-space input (brush
+  // points, crop marquees, SAM masks) is converted on the way in.
+  // ---------------------------------------------------------------------------
+  interface LayerFrame {
+    w: number; h: number;    // layer size in doc px
+    cx: number; cy: number;  // layer center in doc px
+    rad: number;             // rotation in radians
+    mw: number; mh: number;  // mask size in mask px
+    m: number;               // doc px → mask px
+  }
+
+  const frameFor = (
+    iw: number, ih: number,
+    geom: { x: number; y: number; scale: number; rotation: number },
+    mw: number, mh: number,
+  ): LayerFrame => {
+    const w = (iw * geom.scale) || 1, h = (ih * geom.scale) || 1;
+    return {
+      w, h,
+      cx: geom.x + w / 2,
+      cy: geom.y + h / 2,
+      rad: (geom.rotation * Math.PI) / 180,
+      mw, mh,
+      m: mw / w,
+    };
+  };
+
+  /** Frame for a live layer — null until its pixels and mask are loaded. */
+  const layerFrame = (layer: CompLayer): LayerFrame | null => {
+    const img = imagesRef.current.get(layer.id);
+    const mask = masksRef.current.get(layer.id);
+    if (!img || !mask) return null;
+    return frameFor(img.naturalWidth, img.naturalHeight, layer, mask.width, mask.height);
+  };
+
+  /** Doc-space point → mask pixel. */
+  const docToMask = (f: LayerFrame, x: number, y: number) => {
+    const dx = x - f.cx, dy = y - f.cy;
+    const c = Math.cos(-f.rad), s = Math.sin(-f.rad);
+    return {
+      x: (dx * c - dy * s) * f.m + f.mw / 2,
+      y: (dx * s + dy * c) * f.m + f.mh / 2,
+    };
+  };
+
+  /** Set a context up so doc-space drawing lands in mask space. */
+  const useDocToMask = (ctx: CanvasRenderingContext2D, f: LayerFrame) => {
+    ctx.translate(f.mw / 2, f.mh / 2);
+    ctx.scale(f.m, f.m);
+    ctx.rotate(-f.rad);
+    ctx.translate(-f.cx, -f.cy);
+  };
+
+  /** Rasterize a doc-space stamp into a fresh mask-space canvas. */
+  const docStampToMask = (f: LayerFrame, src: CanvasImageSource, sw: number, sh: number) => {
+    const out = document.createElement('canvas');
+    out.width = f.mw; out.height = f.mh;
+    const octx = out.getContext('2d')!;
+    octx.save();
+    useDocToMask(octx, f);
+    octx.drawImage(src, 0, 0, sw, sh);
+    octx.restore();
+    return out;
+  };
+
+  // ---------------------------------------------------------------------------
   // Compositing
   // ---------------------------------------------------------------------------
   /**
@@ -616,12 +691,11 @@ const LayerStudioView: React.FC = () => {
       lctx.rotate((layer.rotation * Math.PI) / 180);
       lctx.imageSmoothingQuality = 'high';
       lctx.drawImage(img, (-w / 2) * k, (-h / 2) * k, w * k, h * k);
-      lctx.restore();
-
-      // Apply mask (alpha). Feather is already baked into the mask per-stroke.
+      // The mask rides with the layer: same rect, same rotation. Feather is
+      // already baked into it per-stroke, so no global blur here.
       lctx.globalCompositeOperation = 'destination-in';
-      lctx.drawImage(mask, 0, 0, dw * k, dh * k);
-      lctx.globalCompositeOperation = 'source-over';
+      lctx.drawImage(mask, (-w / 2) * k, (-h / 2) * k, w * k, h * k);
+      lctx.restore();
 
       ctx.globalAlpha = layer.opacity;
       ctx.drawImage(lc, 0, 0);
@@ -758,8 +832,7 @@ const LayerStudioView: React.FC = () => {
   // ---------------------------------------------------------------------------
   // Painting
   // ---------------------------------------------------------------------------
-  const stampBrush = (mctx: CanvasRenderingContext2D, x: number, y: number) => {
-    const r = brushSize / 2;
+  const stampBrush = (mctx: CanvasRenderingContext2D, x: number, y: number, r: number) => {
     // Inner (full-alpha) radius. Clamp below r: identical inner/outer radii make
     // createRadialGradient paint nothing, which would break a fully-hard brush.
     const inner = r * Math.min(brushHardness, 0.98);
@@ -778,22 +851,30 @@ const LayerStudioView: React.FC = () => {
     // once when the stroke is committed, so the interior stays solid and only
     // this stroke's edge is softened — earlier strokes are untouched.
     const stroke = strokeCanvasRef.current;
-    if (!stroke) return;
+    const info = strokeInfoRef.current;
+    if (!stroke || !info) return;
     const sctx = stroke.getContext('2d')!;
+
+    // Paint where the cursor is *on the image*, not on the artboard. The brush
+    // size stays a doc-space measure, so the on-screen circle matches the mark
+    // whatever scale the layer is at.
+    const f = info.frame;
+    const p = docToMask(f, docX, docY);
+    const r = Math.max(0.5, (brushSize / 2) * f.m);
 
     const last = lastPaintRef.current;
     if (last) {
-      const dx = docX - last.x, dy = docY - last.y;
+      const dx = p.x - last.x, dy = p.y - last.y;
       const dist = Math.hypot(dx, dy);
-      const step = Math.max(2, brushSize * 0.15);
+      const step = Math.max(1, r * 0.3);
       const n = Math.max(1, Math.floor(dist / step));
       for (let i = 1; i <= n; i++) {
-        stampBrush(sctx, last.x + (dx * i) / n, last.y + (dy * i) / n);
+        stampBrush(sctx, last.x + (dx * i) / n, last.y + (dy * i) / n, r);
       }
     } else {
-      stampBrush(sctx, docX, docY);
+      stampBrush(sctx, p.x, p.y, r);
     }
-    lastPaintRef.current = { x: docX, y: docY };
+    lastPaintRef.current = { x: p.x, y: p.y };
     scheduleRedraw();
   };
 
@@ -868,13 +949,19 @@ const LayerStudioView: React.FC = () => {
     sctx.putImageData(idata, 0, 0);
 
     const mask = masksRef.current.get(layerId);
-    if (!mask) return;
+    const layer = layersRef.current.find(l => l.id === layerId);
+    if (!mask || !layer) return;
+    const f = layerFrame(layer);
+    if (!f) return;
+    // SAM works on the composited artboard, so its mask is doc-space: reproject
+    // it onto the layer before baking, then blur in mask px.
+    const stamp = docStampToMask(f, sel, dw, dh);
     pushHistory();
     const mctx = mask.getContext('2d')!;
     mctx.save();
     mctx.globalCompositeOperation = maskMode === 'hide' ? 'destination-out' : 'source-over';
-    if (brushFeatherRef.current > 0) mctx.filter = `blur(${brushFeatherRef.current}px)`;
-    mctx.drawImage(sel, 0, 0);
+    if (brushFeatherRef.current > 0) mctx.filter = `blur(${brushFeatherRef.current * f.m}px)`;
+    mctx.drawImage(stamp, 0, 0);
     mctx.restore();
     redrawAll();
     markDirty();
@@ -998,7 +1085,35 @@ const LayerStudioView: React.FC = () => {
       activeId: activeIdRef.current,
       layers: layersRef.current.map(l => ({ ...l })),
       masks,
+      maskSpace: 'layer',
     });
+  };
+
+  /**
+   * Reproject a legacy doc-space mask onto its layer. The old format painted
+   * holes in artboard coordinates, so map the holes — not the mask — through the
+   * layer transform: anything the artboard never covered stays revealed.
+   */
+  const legacyMaskToLayer = (docMask: HTMLImageElement, f: LayerFrame, dw: number, dh: number) => {
+    const holes = document.createElement('canvas');
+    holes.width = dw; holes.height = dh;
+    const hctx = holes.getContext('2d')!;
+    hctx.fillStyle = '#fff';
+    hctx.fillRect(0, 0, dw, dh);
+    hctx.globalCompositeOperation = 'destination-out';
+    hctx.drawImage(docMask, 0, 0, dw, dh); // now opaque exactly where the layer was hidden
+
+    const mask = document.createElement('canvas');
+    mask.width = f.mw; mask.height = f.mh;
+    const mctx = mask.getContext('2d')!;
+    mctx.fillStyle = '#fff';
+    mctx.fillRect(0, 0, f.mw, f.mh);
+    mctx.save();
+    mctx.globalCompositeOperation = 'destination-out';
+    useDocToMask(mctx, f);
+    mctx.drawImage(holes, 0, 0);
+    mctx.restore();
+    return mask;
   };
 
   /** Rebuild the active working state from a serialized tab doc. */
@@ -1008,13 +1123,25 @@ const LayerStudioView: React.FC = () => {
     await Promise.all(doc.layers.map(async l => {
       const asset = assetsRef.current.get(l.assetId);
       if (asset) imgMap.set(l.id, asset.img);
-      const mc = document.createElement('canvas');
-      mc.width = doc.docW; mc.height = doc.docH;
-      const mctx = mc.getContext('2d')!;
+      const iw = asset?.img.naturalWidth || asset?.w || doc.docW;
+      const ih = asset?.img.naturalHeight || asset?.h || doc.docH;
       const murl = doc.masks[l.id];
-      if (murl) { try { mctx.drawImage(await loadImageEl(murl), 0, 0, doc.docW, doc.docH); } catch { mctx.fillStyle = '#fff'; mctx.fillRect(0, 0, doc.docW, doc.docH); } }
-      else { mctx.fillStyle = '#fff'; mctx.fillRect(0, 0, doc.docW, doc.docH); }
-      maskMap.set(l.id, mc);
+      let mc: HTMLCanvasElement | null = null;
+      if (murl) {
+        try {
+          const mimg = await loadImageEl(murl);
+          if (doc.maskSpace === 'layer') {
+            const { w, h } = maskDims(iw, ih);
+            mc = document.createElement('canvas');
+            mc.width = w; mc.height = h;
+            mc.getContext('2d')!.drawImage(mimg, 0, 0, w, h);
+          } else {
+            const { w, h } = maskDims(iw, ih);
+            mc = legacyMaskToLayer(mimg, frameFor(iw, ih, l, w, h), doc.docW, doc.docH);
+          }
+        } catch { mc = null; }
+      }
+      maskMap.set(l.id, mc ?? blankMask(iw, ih));
     }));
     const layers = doc.layers.filter(l => imgMap.has(l.id));
     imagesRef.current = imgMap;
@@ -1032,7 +1159,7 @@ const LayerStudioView: React.FC = () => {
 
   const emptyTabDoc = (name: string): PersistedTab => {
     const d = dimsForAspect(16, 9);
-    return { id: newUUID(), name, docW: d.w, docH: d.h, aw: 16, ah: 9, bgColor: DEFAULT_BG, showBounds: true, activeId: null, layers: [], masks: {} };
+    return { id: newUUID(), name, docW: d.w, docH: d.h, aw: 16, ah: 9, bgColor: DEFAULT_BG, showBounds: true, activeId: null, layers: [], masks: {}, maskSpace: 'layer' };
   };
 
   const switchTab = async (tabId: string) => {
@@ -1395,13 +1522,16 @@ const LayerStudioView: React.FC = () => {
     }
     if (tool === 'mask') {
       const id = activeIdRef.current;
-      if (!id) return;
+      const layer = layersRef.current.find(l => l.id === id);
+      if (!id || !layer) return;
+      const frame = layerFrame(layer);
+      if (!frame) return;
       pushHistory();
-      // Fresh buffer for this stroke, at doc resolution.
+      // Fresh buffer for this stroke, in the active layer's mask space.
       const buf = document.createElement('canvas');
-      buf.width = docWRef.current; buf.height = docHRef.current;
+      buf.width = frame.mw; buf.height = frame.mh;
       strokeCanvasRef.current = buf;
-      strokeInfoRef.current = { layerId: id, mode: maskMode, feather: brushFeatherRef.current };
+      strokeInfoRef.current = { layerId: id, mode: maskMode, feather: brushFeatherRef.current * frame.m, frame };
       dragRef.current = { mode: 'paint', sx: e.clientX, sy: e.clientY, ox: 0, oy: 0 };
       lastPaintRef.current = null;
       paintAt(p.x, p.y);
@@ -1615,20 +1745,29 @@ const LayerStudioView: React.FC = () => {
     patchLayer(id, { scale: cover, rotation: 0, x: (dw - w) / 2, y: (dh - h) / 2 });
   };
 
-  // Set a layer's mask to a single opaque rectangle (crops the layer to it).
-  const setRectMask = (layerId: string, rx: number, ry: number, rw: number, rh: number) => {
-    const dw = docWRef.current, dh = docHRef.current;
-    const mask = blankMaskTransparent(dw, dh);
+  /**
+   * Set a layer's mask to a single opaque doc-space rectangle (crops the layer
+   * to it). `geom` overrides the layer's stored transform for callers that are
+   * about to move it in the same commit (auto layout).
+   */
+  const setRectMask = (
+    layerId: string, rx: number, ry: number, rw: number, rh: number,
+    geom?: { x: number; y: number; scale: number; rotation: number },
+  ) => {
+    const img = imagesRef.current.get(layerId);
+    const layer = layersRef.current.find(l => l.id === layerId);
+    if (!img || !layer) return;
+    const { w: mw, h: mh } = maskDims(img.naturalWidth, img.naturalHeight);
+    const f = frameFor(img.naturalWidth, img.naturalHeight, geom ?? layer, mw, mh);
+    const mask = document.createElement('canvas');
+    mask.width = mw; mask.height = mh; // fully transparent → only the rect shows
     const mctx = mask.getContext('2d')!;
+    mctx.save();
+    useDocToMask(mctx, f);              // a rotated layer gets a rotated rect
     mctx.fillStyle = '#fff';
     mctx.fillRect(rx, ry, rw, rh);
+    mctx.restore();
     masksRef.current.set(layerId, mask);
-  };
-
-  const blankMaskTransparent = (dw: number, dh: number) => {
-    const c = document.createElement('canvas');
-    c.width = dw; c.height = dh;
-    return c; // fully transparent → nothing shown until a rect is painted
   };
 
   // ---------------------------------------------------------------------------
@@ -1687,8 +1826,9 @@ const LayerStudioView: React.FC = () => {
         const cover = Math.max(cellW / it.img.naturalWidth, cellH / it.img.naturalHeight);
         const w = it.img.naturalWidth * cover, h = it.img.naturalHeight * cover;
         // Center the covered image on the cell, crop to the cell via a rect mask.
-        patches.set(it.id, { x: x + (cellW - w) / 2, y: y + (cellH - h) / 2, scale: cover, rotation: 0 });
-        setRectMask(it.id, x, y, cellW, cellH);
+        const geom = { x: x + (cellW - w) / 2, y: y + (cellH - h) / 2, scale: cover, rotation: 0 };
+        patches.set(it.id, geom);
+        setRectMask(it.id, x, y, cellW, cellH, geom); // the layer's new placement, not its old one
         x += cellW + gap;
       }
       y += cellH + gap;
