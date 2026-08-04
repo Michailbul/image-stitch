@@ -51,6 +51,12 @@ export interface PersistedTab {
   // 'layer' = masks are stored in each layer's own pixel space (current).
   // Absent = legacy doc-space masks, reprojected onto the layer on load.
   maskSpace?: 'layer';
+  /**
+   * Extra scale the export needs so every source is rendered at full resolution.
+   * Set when an Auto Stitch layout was larger than the artboard pixel budget
+   * allowed. Absent or 1 = the artboard already holds full detail.
+   */
+  nativeScale?: number;
 }
 
 export interface PersistedProject {
