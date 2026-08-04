@@ -1346,6 +1346,16 @@ export default function SmartStitchView() {
     return m;
   }, [images]);
 
+  // The stitch a toolbar download would save: the selected one, or the only one
+  // on the canvas. Keeps saving off the chip that floats above the item, which
+  // clips out of view when the stitch sits near the top of the viewport.
+  const downloadableStitch = useMemo(() => {
+    const stitches = canvasItems.filter(i => i.type === 'stitch' && i.dataUrl);
+    const picked = stitches.filter(i => selectedIds.has(i.id));
+    if (picked.length) return picked[picked.length - 1];
+    return stitches.length === 1 ? stitches[0] : null;
+  }, [canvasItems, selectedIds]);
+
   const activeThread = threads.find(t => t.id === activeThreadId);
   const modMeta = isMac() ? '⌘' : 'Ctrl';
   const panCursor = isSpaceDown ? 'grab' : 'default';
@@ -1608,6 +1618,14 @@ export default function SmartStitchView() {
                       ? 'Box-select two or more items on the canvas to auto stitch them'
                       : `Auto stitch the ${selectedIds.size} selected items — arrange, stitch, download`}>
                     <Sparkles size={13} /> Auto Stitch{selectedIds.size >= 2 ? ` (${selectedIds.size})` : ''}
+                  </button>
+                  <button onClick={() => downloadableStitch && handleDownloadStitch(downloadableStitch)}
+                    disabled={!downloadableStitch}
+                    className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={downloadableStitch
+                      ? `Download the selected stitch as PNG (${downloadableStitch.nativeWidth ?? downloadableStitch.width}×${downloadableStitch.nativeHeight ?? downloadableStitch.height})`
+                      : 'Select a stitched image to download it'}>
+                    <Download size={13} /> PNG
                   </button>
                   <button onClick={handleManualStitch} disabled={canvasItems.length === 0 || isStitching}
                     className="bg-inverse text-inverseText hover:bg-accent hover:text-white px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 shadow-sharp transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
