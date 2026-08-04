@@ -25,7 +25,12 @@ const MIN_ZOOM = 0.02;
 const MAX_ZOOM = 5;
 // Canvas world units are output pixels: images land at native size and the
 // frame's world size is exactly its export resolution.
-const DEFAULT_FRAME_RESOLUTION = 2560;
+// 4K is the delivery size, so a new frame starts there rather than at 2K — the
+// Resolution row still offers HD/2K down and Max up.
+const DEFAULT_FRAME_RESOLUTION = 3840;
+// Ceiling for a canvas stitch. Without it the native-restoring quality scale can
+// emit an 11K sheet from four ordinary images.
+const STITCH_MAX_LONG_EDGE = 4096;
 
 const bboxOf = (rects: { x: number; y: number; width: number; height: number }[]) => {
   const minX = Math.min(...rects.map(r => r.x));
@@ -325,7 +330,16 @@ export default function SmartStitchView() {
     // Uniformly scale the whole composition so the most-downscaled image is
     // drawn at (at least) its native resolution — preserves layout, no quality loss.
     // Items render cover-fit, so the binding axis per item is min(W/w, H/h).
-    const qualityScale = Math.max(1, ...entries.map(e => Math.min(e.nativeWidth / e.width, e.nativeHeight / e.height)));
+    const wantScale = Math.max(1, ...entries.map(e => Math.min(e.nativeWidth / e.width, e.nativeHeight / e.height)));
+    // ...but stop at 4K on the long edge. Never below 1: the stitch is at least as
+    // big as the arrangement on the canvas.
+    const laidOut = bboxOf(entries);
+    const long = Math.max(laidOut.width, laidOut.height) || 1;
+    // ...and 4K is a hard ceiling, not just a limit on the upscale: an arrangement
+    // that already spans more than 4K of world space (e.g. one holding an earlier
+    // stitch at native size) is scaled down to fit. The stitcher rounds its own
+    // bounding box up, so leave a pixel of slack or a 4096 target lands on 4097.
+    const qualityScale = Math.max(0.01, Math.min(wantScale, (STITCH_MAX_LONG_EDGE - 1) / long));
     const payload = entries.map(e => ({
       dataUrl: e.dataUrl,
       x: e.x * qualityScale,
