@@ -226,6 +226,22 @@ describe('exportScaleForDoc', () => {
     expect(8000 * k).toBeLessThanOrEqual(16384);
   });
 
+  it('holds a stitch of large sources to a 4K deliverable, canvas and export', () => {
+    // Six 6000px sources: full native would want ~8K+. The stitch canvas caps at
+    // 4096, and the export renders no larger.
+    const items = Array.from({ length: 6 }, (_, i) => img(`i${i}`, 6000, 4000));
+    const layout = stitchAtNativeResolution(items, {
+      targetAspect: aspect(3, 2), gapRatio: 0.015, maxSide: 4096, maxPixels: 4096 * 4096,
+    });
+    expect(Math.max(layout.width, layout.height)).toBeLessThanOrEqual(4096);
+
+    const k = exportScaleForDoc({
+      docW: layout.width, docH: layout.height, wanted: layout.nativeScale,
+      minLongEdge: 2048, maxSide: 4096, maxPixels: 4096 * 4096,
+    });
+    expect(Math.max(layout.width, layout.height) * k).toBeLessThanOrEqual(4096);
+  });
+
   it('guards against a non-finite wanted scale', () => {
     expect(exportScaleForDoc({ docW: 2048, docH: 1152, wanted: Number.NaN })).toBe(1);
   });

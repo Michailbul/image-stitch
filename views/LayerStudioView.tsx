@@ -7,6 +7,7 @@ import {
 import {
   chooseStitchRows, exportScaleForDoc, fitStitchInBox, stitchAtNativeResolution,
 } from '../utils/stitchLayout';
+import { downloadCanvasPng } from '../utils/download';
 import {
   Upload,
   Move,
@@ -49,11 +50,13 @@ import {
 // --- Config ---
 const DOC_LONG = 2048;         // artboard long-edge working resolution (px)
 const EXPORT_LONG_EDGE = 2048; // minimum export long edge (larger docs export at their own resolution)
-// Export renders to a throwaway canvas, so it gets a far bigger budget than the
-// interactive artboard — that headroom is what lets a stitch the artboard had to
-// shrink come back out at full source resolution.
-const EXPORT_MAX_SIDE = 16384;
-const EXPORT_MAX_PIXELS = 8192 * 8192;
+// 4K is the ceiling for everything Auto Stitch produces — the stitch canvas and
+// the export that follows it. Recovering full source resolution for a dense
+// stitch would mean 8K+ files; 4K is the deliverable size, so the layout is
+// allowed to downscale sources rather than blow past it.
+const MAX_LONG_EDGE_4K = 4096;
+const EXPORT_MAX_SIDE = MAX_LONG_EDGE_4K;
+const EXPORT_MAX_PIXELS = MAX_LONG_EDGE_4K * MAX_LONG_EDGE_4K;
 const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
 
 const ASPECTS: { label: string; w: number; h: number; hint?: string }[] = [
@@ -220,6 +223,16 @@ const LayerStudioView: React.FC = () => {
   // --- Layers (metadata only; pixels live in refs) ---
   const [layers, setLayers] = useState<CompLayer[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  // Box selection: drag on empty artboard with the move tool. Auto Stitch acts on
+  // the selection when there is one, so a subset can be stitched on its own.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const selectedIdsRef = useRef<Set<string>>(new Set());
+  selectedIdsRef.current = selectedIds;
+  // Marquee rect in doc space while dragging, plus the selection it started from
+  // (shift-drag adds) and the per-layer origins of a multi-layer move.
+  const marqueeRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const marqueeBaseRef = useRef<Set<string>>(new Set());
+  const moveOriginsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
 
   // Non-reactive pixel stores for the ACTIVE tab (keyed by layer id).
   const imagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -320,7 +333,7 @@ const LayerStudioView: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Interaction state
-  const dragRef = useRef<{ mode: 'none' | 'move' | 'pan' | 'paint' | 'crop'; sx: number; sy: number; ox: number; oy: number } | null>(null);
+  const dragRef = useRef<{ mode: 'none' | 'move' | 'pan' | 'paint' | 'crop' | 'marquee'; sx: number; sy: number; ox: number; oy: number } | null>(null);
   const lastPaintRef = useRef<{ x: number; y: number } | null>(null);
   // Crop marquee (doc-space rect) while dragging with the crop tool.
   const cropRectRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
@@ -440,6 +453,8 @@ const LayerStudioView: React.FC = () => {
     }
     setAssets(prev => [...prev, ...newAssets]);
     setLayers(prev => [...prev, ...newLayers]);
+    setSelectedIds(new Set()); // a stale selection must not narrow the stitch
+    selectedIdsRef.current = new Set();
     if (lastId) setActiveId(lastId);
 
     // Two or more frames on the artboard would otherwise land as a centered
@@ -831,6 +846,39 @@ const LayerStudioView: React.FC = () => {
       ctx.strokeRect(off.x - 0.5, off.y - 0.5, bw + 1, bh + 1);
       ctx.strokeStyle = 'rgba(0,0,0,0.55)';
       ctx.strokeRect(off.x - 1.5, off.y - 1.5, bw + 3, bh + 3);
+    }
+
+    // Box selection: outline every selected layer, plus the live marquee.
+    if (tool === 'move') {
+      const sel = selectedIdsRef.current;
+      if (sel.size > 1) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,85,46,0.75)';
+        ctx.lineWidth = 1;
+        for (const l of layersRef.current) {
+          if (!sel.has(l.id)) continue;
+          const img = imagesRef.current.get(l.id);
+          if (!img) continue;
+          const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
+          ctx.strokeRect(off.x + l.x * s, off.y + l.y * s, w * s, h * s);
+        }
+        ctx.restore();
+      }
+      const mq = marqueeRef.current;
+      if (mq) {
+        const rx = off.x + Math.min(mq.x0, mq.x1) * s;
+        const ry = off.y + Math.min(mq.y0, mq.y1) * s;
+        const rw = Math.abs(mq.x1 - mq.x0) * s;
+        const rh = Math.abs(mq.y1 - mq.y0) * s;
+        ctx.save();
+        ctx.fillStyle = 'rgba(255,85,46,0.10)';
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeStyle = '#FF552E';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.restore();
+      }
     }
 
     // Active layer bounds.
@@ -1535,6 +1583,12 @@ const LayerStudioView: React.FC = () => {
       const meta = e.metaKey || e.ctrlKey;
       if (meta && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
       if (meta && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
+      if (meta && e.key.toLowerCase() === 'a' && !typing) {
+        e.preventDefault();
+        setSelectedIds(new Set(layersRef.current.map(l => l.id)));
+        return;
+      }
+      if (e.key === 'Escape' && !typing) { setSelectedIds(new Set()); scheduleRedraw(); return; }
       if (meta || typing) return;
       switch (e.key.toLowerCase()) {
         case 'v': setTool('move'); break;
@@ -1608,10 +1662,68 @@ const LayerStudioView: React.FC = () => {
       lastPaintRef.current = null;
       paintAt(p.x, p.y);
     } else if (tool === 'move') {
-      const active = layersRef.current.find(l => l.id === activeIdRef.current);
+      const hit = layerAt(p.x, p.y);
+      const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+      if (!hit) {
+        // Empty artboard → box-select. A plain click (no drag) clears.
+        marqueeRef.current = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+        marqueeBaseRef.current = additive ? new Set(selectedIdsRef.current) : new Set();
+        if (!additive) setSelectedIds(new Set());
+        dragRef.current = { mode: 'marquee', sx: p.x, sy: p.y, ox: 0, oy: 0 };
+        scheduleRedraw();
+        return;
+      }
+      // Clicking a layer selects it (shift/⌘ adds), and drags the whole selection.
+      let sel = selectedIdsRef.current;
+      if (additive) {
+        sel = new Set(sel);
+        if (sel.has(hit.id)) sel.delete(hit.id); else sel.add(hit.id);
+        setSelectedIds(sel);
+      } else if (!sel.has(hit.id)) {
+        sel = new Set([hit.id]);
+        setSelectedIds(sel);
+      }
+      if (hit.id !== activeIdRef.current) { setActiveId(hit.id); activeIdRef.current = hit.id; }
       movePushedRef.current = false;
-      dragRef.current = { mode: 'move', sx: p.x, sy: p.y, ox: active?.x ?? 0, oy: active?.y ?? 0 };
+      // Origins for every layer that moves with this drag.
+      moveOriginsRef.current = new Map(
+        layersRef.current
+          .filter(l => (sel.size > 1 ? sel.has(l.id) : l.id === hit.id))
+          .map(l => [l.id, { x: l.x, y: l.y }]),
+      );
+      dragRef.current = { mode: 'move', sx: p.x, sy: p.y, ox: hit.x, oy: hit.y };
     }
+  };
+
+  /** Topmost visible layer whose (unrotated) box contains a doc-space point. */
+  const layerAt = (x: number, y: number): CompLayer | null => {
+    const ls = layersRef.current;
+    for (let i = ls.length - 1; i >= 0; i--) {
+      const l = ls[i];
+      if (!l.visible) continue;
+      const img = imagesRef.current.get(l.id);
+      if (!img) continue;
+      const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
+      if (x >= l.x && x <= l.x + w && y >= l.y && y <= l.y + h) return l;
+    }
+    return null;
+  };
+
+  /** Doc-space bounding box of a set of layers. */
+  const boundsOf = (ids: Set<string> | string[]): { x: number; y: number; w: number; h: number } | null => {
+    const want = ids instanceof Set ? ids : new Set(ids);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const l of layersRef.current) {
+      if (!want.has(l.id)) continue;
+      const img = imagesRef.current.get(l.id);
+      if (!img) continue;
+      minX = Math.min(minX, l.x);
+      minY = Math.min(minY, l.y);
+      maxX = Math.max(maxX, l.x + img.naturalWidth * l.scale);
+      maxY = Math.max(maxY, l.y + img.naturalHeight * l.scale);
+    }
+    if (!Number.isFinite(minX)) return null;
+    return { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) };
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -1638,11 +1750,30 @@ const LayerStudioView: React.FC = () => {
       paintAt(p.x, p.y);
     } else if (d.mode === 'move') {
       const p = screenToDoc(e.clientX, e.clientY);
-      const nx = d.ox + (p.x - d.sx);
-      const ny = d.oy + (p.y - d.sy);
+      const dx = p.x - d.sx, dy = p.y - d.sy;
       if (!movePushedRef.current) { pushHistory(); movePushedRef.current = true; }
-      const id = activeIdRef.current;
-      setLayers(prev => prev.map(l => (l.id === id ? { ...l, x: nx, y: ny } : l)));
+      const origins = moveOriginsRef.current;
+      setLayers(prev => prev.map(l => {
+        const o = origins.get(l.id);
+        return o ? { ...l, x: o.x + dx, y: o.y + dy } : l;
+      }));
+    } else if (d.mode === 'marquee' && marqueeRef.current) {
+      const p = screenToDoc(e.clientX, e.clientY);
+      marqueeRef.current = { ...marqueeRef.current, x1: p.x, y1: p.y };
+      const r = marqueeRef.current;
+      const minX = Math.min(r.x0, r.x1), maxX = Math.max(r.x0, r.x1);
+      const minY = Math.min(r.y0, r.y1), maxY = Math.max(r.y0, r.y1);
+      const hit = new Set(marqueeBaseRef.current);
+      for (const l of layersRef.current) {
+        const img = imagesRef.current.get(l.id);
+        if (!img || !l.visible) continue;
+        const w = img.naturalWidth * l.scale, h = img.naturalHeight * l.scale;
+        // Touch, not enclose — a partial sweep still catches the layer.
+        if (l.x + w > minX && l.x < maxX && l.y + h > minY && l.y < maxY) hit.add(l.id);
+      }
+      selectedIdsRef.current = hit;
+      setSelectedIds(hit);
+      scheduleRedraw();
     } else if (d.mode === 'crop' && cropRectRef.current) {
       const p = screenToDoc(e.clientX, e.clientY);
       cropRectRef.current = { ...cropRectRef.current, x1: p.x, y1: p.y };
@@ -1656,6 +1787,16 @@ const LayerStudioView: React.FC = () => {
     lastPaintRef.current = null;
     if (mode === 'paint') commitStroke();
     else if (mode === 'crop') commitCrop();
+    else if (mode === 'marquee') {
+      marqueeRef.current = null;
+      // The last selected layer becomes active so the Properties panel follows.
+      const sel = selectedIdsRef.current;
+      if (sel.size && !sel.has(activeIdRef.current ?? '')) {
+        const last = [...layersRef.current].reverse().find(l => sel.has(l.id));
+        if (last) setActiveId(last.id);
+      }
+      scheduleRedraw();
+    }
   };
 
   /** Apply the crop marquee to the active layer as a rectangular mask. */
@@ -1727,6 +1868,10 @@ const LayerStudioView: React.FC = () => {
     pushHistory();
     // Keep the source image in imagesRef so an undo can restore the layer.
     masksRef.current.delete(id);
+    setSelectedIds(prev => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev); next.delete(id); return next;
+    });
     setLayers(prev => {
       const out = prev.filter(l => l.id !== id);
       if (activeIdRef.current === id) setActiveId(out.length ? out[out.length - 1].id : null);
@@ -1918,14 +2063,21 @@ const LayerStudioView: React.FC = () => {
   // chosen to land closest to the artboard's aspect.
   //
   // With "Fit canvas" on, the artboard is resized to the stitch and its
-  // resolution is raised until no image is downscaled (capped by the pixel
-  // budget) — so the composite is sharp instead of squeezed into a 2K frame.
+  // resolution raised toward the point where no image is downscaled — so the
+  // composite is sharp instead of squeezed into a 2K frame. 4K is the ceiling:
+  // a dense stitch of large sources is downscaled to fit it rather than growing
+  // into an 8K file.
   // ---------------------------------------------------------------------------
   const stitchLayers = (opts: { history?: boolean; layers?: CompLayer[] } = {}) => {
     // `opts.layers` lets a caller stitch a list it has in hand — importFiles runs
     // before React has committed the new layers, so the ref would be stale.
     const source = opts.layers ?? layersRef.current;
-    const entries = source
+    // A box selection of 2+ layers stitches just those, in place: the rest of the
+    // composition and the artboard are left alone.
+    const sel = selectedIdsRef.current;
+    const subset = !opts.layers && sel.size > 1 && sel.size < source.length;
+    const pool = subset ? source.filter(l => sel.has(l.id)) : source;
+    const entries = pool
       .map(l => { const img = imagesRef.current.get(l.id); return img ? { l, img } : null; })
       .filter(Boolean) as { l: CompLayer; img: HTMLImageElement }[];
     if (!entries.length) return;
@@ -1939,12 +2091,22 @@ const LayerStudioView: React.FC = () => {
     let placements;
     let nextW = dw, nextH = dh;
     let wantScale = 1; // what the export needs to restore full source detail
-    if (stitchFitCanvasRef.current) {
+    if (subset) {
+      // Arrange the selection inside its own bounding box — the canvas keeps its
+      // size, and layers outside the selection do not move.
+      const b = boundsOf(sel) ?? { x: 0, y: 0, w: dw, h: dh };
+      const layout = fitStitchInBox(inputs, {
+        boxWidth: b.w, boxHeight: b.h, gap: b.w * gapRatio, targetAspect: b.w / b.h,
+      });
+      placements = layout.items.map(p => ({ ...p, x: p.x + b.x, y: p.y + b.y }));
+      // Keep whatever the doc already needed; a subset never lowers the bar.
+      wantScale = Math.max(nativeScaleRef.current, layout.nativeScale);
+    } else if (stitchFitCanvasRef.current) {
       const layout = stitchAtNativeResolution(inputs, {
         gapRatio,
         targetAspect: dw / dh,
-        maxSide: MAX_SIDE,
-        maxPixels: MAX_PIXELS,
+        maxSide: Math.min(MAX_SIDE, MAX_LONG_EDGE_4K),
+        maxPixels: Math.min(MAX_PIXELS, MAX_LONG_EDGE_4K * MAX_LONG_EDGE_4K),
       });
       // clampDims can shrink further (min edge / rounding) — rescale to match.
       const { w, h } = clampDims(layout.width, layout.height);
@@ -2002,9 +2164,11 @@ const LayerStudioView: React.FC = () => {
   const [exporting, setExporting] = useState(false);
   /**
    * Export scale: at least 2K on the long edge, never below the artboard's own
-   * resolution, and up to `nativeScale` so a stitch the artboard had to shrink is
-   * written out at full source resolution. Layers are re-drawn from their original
-   * images at this scale — this is a bigger render, not an upscale of the preview.
+   * resolution, and up to `nativeScale` so a stitch the artboard had to shrink
+   * regains source detail — bounded by the 4K ceiling. Layers are re-drawn from
+   * their original images at this scale: a bigger render, not an upscale of the
+   * preview. A doc the user sized past 4K by hand still exports 1:1, never below
+   * its own pixels.
    */
   const exportScale = exportScaleForDoc({
     docW, docH,
@@ -2035,15 +2199,7 @@ const LayerStudioView: React.FC = () => {
       const ctx = out.getContext('2d')!;
       ctx.imageSmoothingQuality = 'high';
       compositeInto(ctx, k);
-      // A large export as a data URL would balloon in memory (base64 of a 40MP
-      // PNG); a blob URL hands the bytes straight to the download.
-      const blob = await new Promise<Blob | null>(res => out.toBlob(res, 'image/png'));
-      const url = blob ? URL.createObjectURL(blob) : out.toDataURL('image/png');
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `layer-studio-${out.width}x${out.height}.png`;
-      a.click();
-      if (blob) setTimeout(() => URL.revokeObjectURL(url), 10000);
+      await downloadCanvasPng(out, `layer-studio-${out.width}x${out.height}.png`);
     } finally {
       setExporting(false);
     }
@@ -2060,6 +2216,8 @@ const LayerStudioView: React.FC = () => {
   const active = layers.find(l => l.id === activeId);
   const hasLayers = layers.length > 0;
   const isCustomBg = bgColor !== null && !BG_SWATCHES.some(s => s.value === bgColor);
+  // Auto Stitch acts on the box selection when it is a real subset of the layers.
+  const stitchSubset = selectedIds.size > 1 && selectedIds.size < layers.length;
   // Row split the next Auto Stitch would use — shown in the section header so the
   // shape is visible before committing to it.
   const stitchRows = React.useMemo(() => {
@@ -2266,15 +2424,18 @@ const LayerStudioView: React.FC = () => {
               <LayoutGrid size={13} /> Fill
             </button>
             <button onClick={() => stitchLayers()} disabled={!hasLayers}
-              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Auto Stitch — justified rows of whole frames, nothing cropped (⇧L)">
-              <Rows3 size={13} /> Stitch
+              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary"
+              title={stitchSubset
+                ? `Auto Stitch ${selectedIds.size} selected layers into justified rows, in place (⇧L)`
+                : 'Auto Stitch — justified rows of whole frames, nothing cropped. Box-select on the artboard to stitch a subset (⇧L)'}>
+              <Rows3 size={13} /> Stitch{stitchSubset ? ` ${selectedIds.size}` : ''}
             </button>
             <button onClick={() => { fitView(); drawView(); }}
               className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0" title="Fit (F)">
               <Maximize size={13} /> Fit
             </button>
             <button onClick={exportImage} disabled={exporting}
-              title={`Exports ${exportDims.w}×${exportDims.h} PNG${exportScale > 1.001 ? ` — ${exportScale.toFixed(2)}× the artboard, so every source keeps its full resolution` : ''}`}
+              title={`Exports ${exportDims.w}×${exportDims.h} PNG${exportScale > 1.001 ? ` — rendered at ${exportScale.toFixed(2)}× the artboard to recover source detail, up to 4K` : ''}`}
               className="flex items-center gap-2 bg-accent text-white text-xs font-medium px-4 py-2 rounded-lg hover:opacity-90 disabled:opacity-40 transition-opacity shrink-0 whitespace-nowrap">
               <Download size={14} /> {exporting ? 'Exporting…' : `Export ${(() => { const l = Math.max(exportDims.w, exportDims.h) / 1024; return `${l.toFixed(l % 1 < 0.05 ? 0 : 1)}K`; })()}`}
             </button>
@@ -2478,7 +2639,7 @@ const LayerStudioView: React.FC = () => {
             <PropSlider label="Gap" value={stitchGap} min={0} max={STITCH_GAP_MAX} step={0.5} suffix="%"
               onChange={(v: number) => { setStitchGap(v); localStorage.setItem(STITCH_GAP_KEY, String(v)); }} />
             <button onClick={() => { const v = !stitchFitCanvas; setStitchFitCanvas(v); localStorage.setItem(STITCH_FIT_KEY, v ? '1' : '0'); }}
-              title="On: the canvas is resized to the stitch and its resolution raised so no image is downscaled. Off: the stitch is fitted inside the current artboard."
+              title="On: the canvas is resized to the stitch, at the highest resolution up to 4K. Off: the stitch is fitted inside the current artboard."
               className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
               <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchFitCanvas ? 'bg-accent border-accent' : 'border-border'}`}>
                 {stitchFitCanvas && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
@@ -2496,7 +2657,7 @@ const LayerStudioView: React.FC = () => {
             <div className="flex items-center gap-2">
               <button onClick={() => stitchLayers()} disabled={!hasLayers}
                 className="flex-1 flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide px-2 py-2 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors disabled:opacity-30 disabled:hover:text-secondary disabled:hover:border-border">
-                <Rows3 size={11} /> Stitch now
+                <Rows3 size={11} /> {stitchSubset ? `Stitch ${selectedIds.size} selected` : 'Stitch now'}
               </button>
               <button onClick={() => autoLayout(stitchGap)} disabled={!hasLayers}
                 title="Fill the artboard instead — cells are cropped to cover"
@@ -2505,7 +2666,8 @@ const LayerStudioView: React.FC = () => {
               </button>
             </div>
             <p className="text-[9px] font-mono text-secondary/70 leading-relaxed">
-              Justified rows, whole frames, nothing cropped. Row split follows the artboard aspect.
+              Justified rows, whole frames, nothing cropped. Row split follows the artboard aspect. Max 4K.
+              {' '}Box-select on the artboard (move tool) to stitch only those layers, in place.
             </p>
           </div>
           )}
@@ -2571,10 +2733,20 @@ const LayerStudioView: React.FC = () => {
               index={i}
               img={imagesRef.current.get(layer.id)}
               active={layer.id === activeId}
+              selected={selectedIds.has(layer.id)}
               renaming={renamingLayerId === layer.id}
               dragging={dragLayerId === layer.id}
               hint={dropHint?.id === layer.id ? (dropHint.before ? 'before' : 'after') : null}
-              onSelect={() => setActiveId(layer.id)}
+              onSelect={(e: React.MouseEvent) => {
+                setActiveId(layer.id);
+                const additive = e?.shiftKey || e?.metaKey || e?.ctrlKey;
+                setSelectedIds(prev => {
+                  if (!additive) return new Set([layer.id]);
+                  const next = new Set(prev);
+                  if (next.has(layer.id)) next.delete(layer.id); else next.add(layer.id);
+                  return next;
+                });
+              }}
               onToggle={() => patchLayer(layer.id, { visible: !layer.visible })}
               onUp={() => moveLayer(layer.id, 1)}
               onDown={() => moveLayer(layer.id, -1)}
@@ -2742,7 +2914,7 @@ const SectionHead = ({ icon, title, open, onToggle, right }: any) => (
 );
 
 const LayerRow = ({
-  layer, img, index, active, renaming, dragging, hint,
+  layer, img, index, active, selected, renaming, dragging, hint,
   onSelect, onToggle, onUp, onDown, onDelete,
   onRenameStart, onRenameCommit, onRenameCancel,
   onDragStart, onDragOverRow, onDragEnd, onDropRow,
@@ -2769,7 +2941,7 @@ const LayerRow = ({
       }}
       onDragEnd={onDragEnd}
       onDrop={e => { e.preventDefault(); e.stopPropagation(); onDropRow(); }}
-      className={`relative flex items-center gap-2 pl-1.5 pr-3 py-2.5 cursor-pointer border-l-2 transition-colors ${active ? 'border-accent bg-accentDim/40' : 'border-transparent hover:bg-surface'} ${dragging ? 'opacity-40' : ''}`}>
+      className={`relative flex items-center gap-2 pl-1.5 pr-3 py-2.5 cursor-pointer border-l-2 transition-colors ${active ? 'border-accent bg-accentDim/40' : selected ? 'border-accent/60 bg-accentDim/20' : 'border-transparent hover:bg-surface'} ${dragging ? 'opacity-40' : ''}`}>
       {hint === 'before' && <span className="absolute left-0 right-0 -top-px h-0.5 bg-accent pointer-events-none" />}
       {hint === 'after' && <span className="absolute left-0 right-0 -bottom-px h-0.5 bg-accent pointer-events-none" />}
       <GripVertical size={13} className="text-secondary/40 shrink-0 cursor-grab" />
