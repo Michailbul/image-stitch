@@ -5,6 +5,9 @@ import {
   PersistedProject, PersistedTab, ProjectMeta,
 } from '../utils/layerStudioStore';
 import {
+  chooseStitchRows, exportScaleForDoc, fitStitchInBox, stitchAtNativeResolution,
+} from '../utils/stitchLayout';
+import {
   Upload,
   Move,
   Brush,
@@ -40,11 +43,17 @@ import {
   Pencil,
   Link,
   Unlink,
+  Rows3,
 } from 'lucide-react';
 
 // --- Config ---
 const DOC_LONG = 2048;         // artboard long-edge working resolution (px)
-const EXPORT_LONG_EDGE = 2048; // 2K export long edge
+const EXPORT_LONG_EDGE = 2048; // minimum export long edge (larger docs export at their own resolution)
+// Export renders to a throwaway canvas, so it gets a far bigger budget than the
+// interactive artboard — that headroom is what lets a stitch the artboard had to
+// shrink come back out at full source resolution.
+const EXPORT_MAX_SIDE = 16384;
+const EXPORT_MAX_PIXELS = 8192 * 8192;
 const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
 
 const ASPECTS: { label: string; w: number; h: number; hint?: string }[] = [
@@ -142,6 +151,23 @@ const readPanelW = () => {
 const readOpen = (key: string) => localStorage.getItem(`ls-open-${key}`) !== '0';
 const writeOpen = (key: string, open: boolean) => localStorage.setItem(`ls-open-${key}`, open ? '1' : '0');
 
+// --- Auto Stitch preferences (remembered across sessions) ---
+const STITCH_GAP_KEY = 'ls-stitch-gap';     // gap as % of the block width
+const STITCH_FIT_KEY = 'ls-stitch-fit';     // size the canvas to the stitch
+const STITCH_AUTO_KEY = 'ls-stitch-auto';   // stitch automatically on import
+const STITCH_GAP_DEFAULT = 1.5;
+const STITCH_GAP_MAX = 8;
+const readStitchGap = () => {
+  const raw = localStorage.getItem(STITCH_GAP_KEY);
+  if (raw === null) return STITCH_GAP_DEFAULT; // Number(null) is 0 — check the string
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= STITCH_GAP_MAX ? n : STITCH_GAP_DEFAULT;
+};
+const readFlag = (key: string, dflt: boolean) => {
+  const v = localStorage.getItem(key);
+  return v === null ? dflt : v === '1';
+};
+
 /** Undo/redo snapshot of the whole editable state. Masks are stored as data URLs. */
 interface Snapshot {
   layers: CompLayer[];
@@ -150,6 +176,10 @@ interface Snapshot {
   aw: number; ah: number;
   docW: number; docH: number;
   activeId: string | null;
+  /** Layers whose mask is a Fill-layout crop rect (safe for Auto Stitch to drop). */
+  cropped: string[];
+  /** Export scale needed for full source resolution (see nativeScale). */
+  nativeScale: number;
 }
 
 interface CompLayer {
@@ -194,6 +224,26 @@ const LayerStudioView: React.FC = () => {
   // Non-reactive pixel stores for the ACTIVE tab (keyed by layer id).
   const imagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const masksRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  // Layers whose current mask is nothing but a Fill-layout crop rect. Auto Stitch
+  // clears these (it shows whole frames) but never touches hand-painted or AI masks.
+  const croppedRef = useRef<Set<string>>(new Set());
+
+  // --- Auto Stitch settings ---
+  const [stitchGap, setStitchGap] = useState(readStitchGap);
+  const [stitchFitCanvas, setStitchFitCanvas] = useState(() => readFlag(STITCH_FIT_KEY, true));
+  const [stitchOnImport, setStitchOnImport] = useState(() => readFlag(STITCH_AUTO_KEY, true));
+  const stitchGapRef = useRef(stitchGap);
+  stitchGapRef.current = stitchGap;
+  const stitchFitCanvasRef = useRef(stitchFitCanvas);
+  stitchFitCanvasRef.current = stitchFitCanvas;
+  const stitchOnImportRef = useRef(stitchOnImport);
+  stitchOnImportRef.current = stitchOnImport;
+  // How much bigger than the artboard the composition would have to be for every
+  // source to sit at full resolution. >1 after a stitch the pixel budget clamped;
+  // the export renders at this scale so none of that detail is lost.
+  const [nativeScale, setNativeScale] = useState(1);
+  const nativeScaleRef = useRef(1);
+  nativeScaleRef.current = nativeScale;
 
   // --- Project: shared assets + tabs ---
   // Assets are uploaded once and shared across every tab in the project.
@@ -232,6 +282,7 @@ const LayerStudioView: React.FC = () => {
   const [showArtboard, setShowArtboard] = useState(() => readOpen('artboard'));
   const [showProps, setShowProps] = useState(() => readOpen('props'));
   const [showAssets, setShowAssets] = useState(() => readOpen('assets'));
+  const [showStitch, setShowStitch] = useState(() => readOpen('stitch'));
   const toggleSection = (key: string, set: React.Dispatch<React.SetStateAction<boolean>>) =>
     set(v => { writeOpen(key, !v); return !v; });
 
@@ -390,7 +441,15 @@ const LayerStudioView: React.FC = () => {
     setAssets(prev => [...prev, ...newAssets]);
     setLayers(prev => [...prev, ...newLayers]);
     if (lastId) setActiveId(lastId);
-    setTimeout(() => { fitView(dw, dh); redrawAll(); }, 0);
+
+    // Two or more frames on the artboard would otherwise land as a centered
+    // pile. Stitch them into justified rows instead (history was pushed above).
+    const all = [...layersRef.current, ...newLayers];
+    const stitch = stitchOnImportRef.current && all.length > 1;
+    setTimeout(() => {
+      if (stitch) stitchLayers({ history: false, layers: all });
+      else { fitView(dw, dh); redrawAll(); }
+    }, 0);
   }, []);
 
   const docWRef = useRef(initial.w);
@@ -458,8 +517,13 @@ const LayerStudioView: React.FC = () => {
         const nwd = img.naturalWidth * ns, nhd = img.naturalHeight * ns;
         return { ...l, scale: ns, x: cx - nwd / 2, y: cy - nhd / 2 };
       }));
+      // Layers shrank with the frame, so the export has that much more to make up.
+      const next = Math.max(1, nativeScaleRef.current * (ow / cw));
+      nativeScaleRef.current = next;
+      setNativeScale(next);
     } else {
       setLayers(prev => prev.map(l => ({ ...l, x: l.x + dx, y: l.y + dy })));
+      // Pixels kept their size — what the export needs is unchanged.
     }
     docWRef.current = cw; docHRef.current = ch;
     setDocW(cw); setDocH(ch);
@@ -1086,6 +1150,7 @@ const LayerStudioView: React.FC = () => {
       layers: layersRef.current.map(l => ({ ...l })),
       masks,
       maskSpace: 'layer',
+      nativeScale: nativeScaleRef.current,
     });
   };
 
@@ -1151,6 +1216,7 @@ const LayerStudioView: React.FC = () => {
     setAspect({ w: doc.aw, h: doc.ah });
     setBgColor(doc.bgColor);
     setShowBounds(doc.showBounds);
+    setNativeScale(doc.nativeScale && doc.nativeScale > 1 ? doc.nativeScale : 1);
     setLayers(layers);
     setActiveId(layers.some(l => l.id === doc.activeId) ? doc.activeId : (layers[layers.length - 1]?.id ?? null));
     histRef.current = []; redoRef.current = []; bumpHist(); // undo is per-tab
@@ -1405,6 +1471,8 @@ const LayerStudioView: React.FC = () => {
       aw: aspectRef.current.w, ah: aspectRef.current.h,
       docW: docWRef.current, docH: docHRef.current,
       activeId: activeIdRef.current,
+      cropped: [...croppedRef.current],
+      nativeScale: nativeScaleRef.current,
     };
   };
 
@@ -1423,6 +1491,8 @@ const LayerStudioView: React.FC = () => {
       newMasks.set(id, await loadMaskCanvas(url));
     }));
     masksRef.current = newMasks;
+    croppedRef.current = new Set(snap.cropped ?? []);
+    setNativeScale(snap.nativeScale ?? 1);
     // Rebuild the per-layer image map from each layer's asset (assetId can
     // change, e.g. the isolate preset swaps a layer's image).
     const imgMap = new Map<string, HTMLImageElement>();
@@ -1474,7 +1544,8 @@ const LayerStudioView: React.FC = () => {
         case 'c': setTool('crop'); break;
         case 'i': case 'e': setTool('eyedropper'); break;
         case 'f': fitView(); drawView(); break;
-        case 'l': autoLayout(); break;
+        // L fills the artboard (crops to cells); ⇧L stitches whole frames.
+        case 'l': e.shiftKey ? stitchLayers() : autoLayout(); break;
         case '=': case '+': zoomBy(1.2); break;
         case '-': case '_': zoomBy(1 / 1.2); break;
         case ' ':
@@ -1527,6 +1598,7 @@ const LayerStudioView: React.FC = () => {
       const frame = layerFrame(layer);
       if (!frame) return;
       pushHistory();
+      croppedRef.current.delete(id); // hand-painted from here on — not a crop rect
       // Fresh buffer for this stroke, in the active layer's mask space.
       const buf = document.createElement('canvas');
       buf.width = frame.mw; buf.height = frame.mh;
@@ -1600,6 +1672,7 @@ const LayerStudioView: React.FC = () => {
     if (w < 4 || h < 4) { scheduleRedraw(); return; } // ignore tiny/accidental drags
     pushHistory();
     setRectMask(id, x, y, w, h);
+    croppedRef.current.delete(id); // a hand crop is intentional — Auto Stitch keeps it
     redrawAll();
     markDirty();
   };
@@ -1829,6 +1902,7 @@ const LayerStudioView: React.FC = () => {
         const geom = { x: x + (cellW - w) / 2, y: y + (cellH - h) / 2, scale: cover, rotation: 0 };
         patches.set(it.id, geom);
         setRectMask(it.id, x, y, cellW, cellH, geom); // the layer's new placement, not its old one
+        croppedRef.current.add(it.id);                // Auto Stitch may drop this crop
         x += cellW + gap;
       }
       y += cellH + gap;
@@ -1838,27 +1912,138 @@ const LayerStudioView: React.FC = () => {
   };
 
   // ---------------------------------------------------------------------------
-  // Export @ 2K
+  // Auto Stitch — arrange the layers as justified rows of WHOLE frames, the way
+  // Smart Stitch does. Nothing is cropped: each image keeps its full frame and
+  // native aspect, rows are justified to a common width, and the row split is
+  // chosen to land closest to the artboard's aspect.
+  //
+  // With "Fit canvas" on, the artboard is resized to the stitch and its
+  // resolution is raised until no image is downscaled (capped by the pixel
+  // budget) — so the composite is sharp instead of squeezed into a 2K frame.
+  // ---------------------------------------------------------------------------
+  const stitchLayers = (opts: { history?: boolean; layers?: CompLayer[] } = {}) => {
+    // `opts.layers` lets a caller stitch a list it has in hand — importFiles runs
+    // before React has committed the new layers, so the ref would be stale.
+    const source = opts.layers ?? layersRef.current;
+    const entries = source
+      .map(l => { const img = imagesRef.current.get(l.id); return img ? { l, img } : null; })
+      .filter(Boolean) as { l: CompLayer; img: HTMLImageElement }[];
+    if (!entries.length) return;
+
+    const inputs = entries.map(({ l, img }) => ({
+      id: l.id, width: img.naturalWidth, height: img.naturalHeight,
+    }));
+    const gapRatio = Math.max(0, stitchGapRef.current) / 100;
+    const dw = docWRef.current, dh = docHRef.current;
+
+    let placements;
+    let nextW = dw, nextH = dh;
+    let wantScale = 1; // what the export needs to restore full source detail
+    if (stitchFitCanvasRef.current) {
+      const layout = stitchAtNativeResolution(inputs, {
+        gapRatio,
+        targetAspect: dw / dh,
+        maxSide: MAX_SIDE,
+        maxPixels: MAX_PIXELS,
+      });
+      // clampDims can shrink further (min edge / rounding) — rescale to match.
+      const { w, h } = clampDims(layout.width, layout.height);
+      const k = layout.width > 0 ? w / layout.width : 1;
+      placements = layout.items.map(p => ({
+        id: p.id, x: p.x * k, y: p.y * k, width: p.width * k, height: p.height * k,
+      }));
+      nextW = w; nextH = h;
+      wantScale = layout.nativeScale / (k || 1);
+    } else {
+      const layout = fitStitchInBox(inputs, {
+        boxWidth: dw, boxHeight: dh, gap: dw * gapRatio,
+      });
+      placements = layout.items;
+      wantScale = layout.nativeScale;
+    }
+    if (!placements.length) return;
+
+    if (opts.history !== false) pushHistory();
+
+    const patches = new Map<string, Partial<CompLayer>>();
+    for (const p of placements) {
+      const src = entries.find(e => e.l.id === p.id);
+      if (!src) continue;
+      patches.set(p.id, {
+        x: p.x,
+        y: p.y,
+        scale: p.width / src.img.naturalWidth,
+        rotation: 0,
+      });
+      // Whole frames — drop a crop rect a previous Fill layout baked in, but
+      // leave hand-painted and AI masks alone.
+      if (croppedRef.current.has(p.id)) {
+        masksRef.current.set(p.id, blankMask(src.img.naturalWidth, src.img.naturalHeight));
+        croppedRef.current.delete(p.id);
+      }
+    }
+
+    const resized = nextW !== dw || nextH !== dh;
+    if (resized) {
+      docWRef.current = nextW; docHRef.current = nextH;
+      setDocW(nextW); setDocH(nextH);
+      setAspect(reduceRatio(nextW, nextH));
+    }
+    nativeScaleRef.current = Math.max(1, wantScale);
+    setNativeScale(Math.max(1, wantScale));
+    setLayers(prev => prev.map(l => (patches.has(l.id) ? { ...l, ...patches.get(l.id)! } : l)));
+    setTimeout(() => { fitView(nextW, nextH); redrawAll(); }, 0);
+    markDirty();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Export
   // ---------------------------------------------------------------------------
   const [exporting, setExporting] = useState(false);
-  const exportImage = () => {
+  /**
+   * Export scale: at least 2K on the long edge, never below the artboard's own
+   * resolution, and up to `nativeScale` so a stitch the artboard had to shrink is
+   * written out at full source resolution. Layers are re-drawn from their original
+   * images at this scale — this is a bigger render, not an upscale of the preview.
+   */
+  const exportScale = exportScaleForDoc({
+    docW, docH,
+    wanted: nativeScale,
+    minLongEdge: EXPORT_LONG_EDGE,
+    maxSide: EXPORT_MAX_SIDE,
+    maxPixels: EXPORT_MAX_PIXELS,
+  });
+  const exportDims = {
+    w: Math.round(docW * exportScale),
+    h: Math.round(docH * exportScale),
+  };
+  const exportImage = async () => {
     const dw = docWRef.current, dh = docHRef.current;
     if (!dw || !dh) return;
     setExporting(true);
     try {
-      const long = Math.max(dw, dh);
-      const k = EXPORT_LONG_EDGE / long;
+      const k = exportScaleForDoc({
+        docW: dw, docH: dh,
+        wanted: nativeScaleRef.current,
+        minLongEdge: EXPORT_LONG_EDGE,
+        maxSide: EXPORT_MAX_SIDE,
+        maxPixels: EXPORT_MAX_PIXELS,
+      });
       const out = document.createElement('canvas');
       out.width = Math.round(dw * k);
       out.height = Math.round(dh * k);
       const ctx = out.getContext('2d')!;
       ctx.imageSmoothingQuality = 'high';
       compositeInto(ctx, k);
-      const url = out.toDataURL('image/png');
+      // A large export as a data URL would balloon in memory (base64 of a 40MP
+      // PNG); a blob URL hands the bytes straight to the download.
+      const blob = await new Promise<Blob | null>(res => out.toBlob(res, 'image/png'));
+      const url = blob ? URL.createObjectURL(blob) : out.toDataURL('image/png');
       const a = document.createElement('a');
       a.href = url;
       a.download = `layer-studio-${out.width}x${out.height}.png`;
       a.click();
+      if (blob) setTimeout(() => URL.revokeObjectURL(url), 10000);
     } finally {
       setExporting(false);
     }
@@ -1875,6 +2060,14 @@ const LayerStudioView: React.FC = () => {
   const active = layers.find(l => l.id === activeId);
   const hasLayers = layers.length > 0;
   const isCustomBg = bgColor !== null && !BG_SWATCHES.some(s => s.value === bgColor);
+  // Row split the next Auto Stitch would use — shown in the section header so the
+  // shape is visible before committing to it.
+  const stitchRows = React.useMemo(() => {
+    const inputs = layers
+      .map(l => { const img = imagesRef.current.get(l.id); return img ? { id: l.id, width: img.naturalWidth, height: img.naturalHeight } : null; })
+      .filter(Boolean) as { id: string; width: number; height: number }[];
+    return inputs.length > 1 ? chooseStitchRows(inputs, docW / docH) : [];
+  }, [layers, docW, docH]);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -2069,16 +2262,21 @@ const LayerStudioView: React.FC = () => {
             <span className="font-mono text-[10px] text-secondary tabular-nums">{zoomPct}%</span>
             <span className="font-mono text-[10px] text-secondary">{docW}×{docH}</span>
             <button onClick={() => autoLayout()} disabled={!hasLayers}
-              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Auto Layout — pack layers to fill the artboard (L)">
-              <LayoutGrid size={13} /> Auto
+              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Fill — tile the artboard, cropping each image to its cell (L)">
+              <LayoutGrid size={13} /> Fill
+            </button>
+            <button onClick={() => stitchLayers()} disabled={!hasLayers}
+              className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Auto Stitch — justified rows of whole frames, nothing cropped (⇧L)">
+              <Rows3 size={13} /> Stitch
             </button>
             <button onClick={() => { fitView(); drawView(); }}
               className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0" title="Fit (F)">
               <Maximize size={13} /> Fit
             </button>
             <button onClick={exportImage} disabled={exporting}
+              title={`Exports ${exportDims.w}×${exportDims.h} PNG${exportScale > 1.001 ? ` — ${exportScale.toFixed(2)}× the artboard, so every source keeps its full resolution` : ''}`}
               className="flex items-center gap-2 bg-accent text-white text-xs font-medium px-4 py-2 rounded-lg hover:opacity-90 disabled:opacity-40 transition-opacity shrink-0 whitespace-nowrap">
-              <Download size={14} /> {exporting ? 'Exporting…' : 'Export 2K'}
+              <Download size={14} /> {exporting ? 'Exporting…' : `Export ${(() => { const l = Math.max(exportDims.w, exportDims.h) / 1024; return `${l.toFixed(l % 1 < 0.05 ? 0 : 1)}K`; })()}`}
             </button>
           </div>
         </div>
@@ -2270,6 +2468,49 @@ const LayerStudioView: React.FC = () => {
         )}
         </div>
 
+        {/* Auto Stitch */}
+        <div className="border-b border-border shrink-0">
+          <SectionHead icon={<Rows3 size={12} className="text-accent" />} title="Auto Stitch" open={showStitch}
+            onToggle={() => toggleSection('stitch', setShowStitch)}
+            right={stitchRows.length ? stitchRows.join('·') : undefined} />
+          {showStitch && (
+          <div className="px-4 pb-4 space-y-3">
+            <PropSlider label="Gap" value={stitchGap} min={0} max={STITCH_GAP_MAX} step={0.5} suffix="%"
+              onChange={(v: number) => { setStitchGap(v); localStorage.setItem(STITCH_GAP_KEY, String(v)); }} />
+            <button onClick={() => { const v = !stitchFitCanvas; setStitchFitCanvas(v); localStorage.setItem(STITCH_FIT_KEY, v ? '1' : '0'); }}
+              title="On: the canvas is resized to the stitch and its resolution raised so no image is downscaled. Off: the stitch is fitted inside the current artboard."
+              className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
+              <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchFitCanvas ? 'bg-accent border-accent' : 'border-border'}`}>
+                {stitchFitCanvas && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
+              </span>
+              Fit canvas to stitch
+            </button>
+            <button onClick={() => { const v = !stitchOnImport; setStitchOnImport(v); localStorage.setItem(STITCH_AUTO_KEY, v ? '1' : '0'); }}
+              title="Arrange automatically whenever an import leaves more than one layer on the artboard."
+              className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
+              <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchOnImport ? 'bg-accent border-accent' : 'border-border'}`}>
+                {stitchOnImport && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
+              </span>
+              Stitch on import
+            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={() => stitchLayers()} disabled={!hasLayers}
+                className="flex-1 flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide px-2 py-2 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors disabled:opacity-30 disabled:hover:text-secondary disabled:hover:border-border">
+                <Rows3 size={11} /> Stitch now
+              </button>
+              <button onClick={() => autoLayout(stitchGap)} disabled={!hasLayers}
+                title="Fill the artboard instead — cells are cropped to cover"
+                className="flex-1 flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide px-2 py-2 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors disabled:opacity-30 disabled:hover:text-secondary disabled:hover:border-border">
+                <LayoutGrid size={11} /> Fill
+              </button>
+            </div>
+            <p className="text-[9px] font-mono text-secondary/70 leading-relaxed">
+              Justified rows, whole frames, nothing cropped. Row split follows the artboard aspect.
+            </p>
+          </div>
+          )}
+        </div>
+
         {/* Active layer properties */}
         {active && (
           <div className="border-b border-border shrink-0">
@@ -2449,13 +2690,13 @@ const Slider = ({ label, value, min, max, step = 1, onChange, suffix = '', w = 9
   </div>
 );
 
-const PropSlider = ({ label, value, min, max, onChange, onStart, suffix = '', icon }: any) => (
+const PropSlider = ({ label, value, min, max, step = 1, onChange, onStart, suffix = '', icon }: any) => (
   <div>
     <div className="flex items-center justify-between mb-1">
       <span className="text-[10px] font-mono uppercase tracking-wide text-secondary flex items-center gap-1">{icon}{label}</span>
       <span className="text-[10px] font-mono text-primary tabular-nums">{value}{suffix}</span>
     </div>
-    <input type="range" min={min} max={max} value={value}
+    <input type="range" min={min} max={max} step={step} value={value}
       onPointerDown={onStart}
       onChange={e => onChange(Number(e.target.value))}
       className="w-full accent-accent" />
