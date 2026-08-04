@@ -10,6 +10,7 @@ import {
   generateSmartStitch, generateManualStitch, loadImage, computeJustifiedLayout, cropImage,
   generateFrameStitch, computeFrameExportScale, FrameAnnotation,
 } from '../utils/imageUtils';
+import { downloadPngDataUrl } from '../utils/download';
 
 type Tool = 'select' | 'brush' | 'line' | 'text';
 const MASK_MAX_DIM = 2048; // cap per-item mask resolution; feather hides upscaling
@@ -379,6 +380,20 @@ export default function SmartStitchView() {
     setAutoPreview({ originals: snap });
   };
 
+  /**
+   * Auto Stitch on the canvas box selection: same flow the library's "Auto Stitch"
+   * runs, but starting from what is already laid out and selected on the canvas.
+   * Arranges into justified rows as a preview; approving stitches and downloads.
+   */
+  const enterAutoStitchFromSelection = () => {
+    if (selectedIds.size === 0) return;
+    const snap: Snapshot = new Map();
+    canvasItems.forEach(i => {
+      if (selectedIds.has(i.id)) snap.set(i.id, { x: i.x, y: i.y, width: i.width, height: i.height });
+    });
+    setAutoPreview({ originals: snap, autoDownload: true });
+  };
+
   const cancelAutoPreview = () => {
     if (!autoPreview) return;
     setCanvasItems(prev => prev.map(ci => {
@@ -624,11 +639,11 @@ export default function SmartStitchView() {
       const result = await generateFrameStitch(entries, frameRect, bg, { resolution: frame.resolution, annotations: anns });
 
       // Download immediately — the frame is the deliverable.
-      const a = document.createElement('a');
-      a.href = result.dataUrl;
       const threadName = threads.find(t => t.id === activeThreadId)?.name || 'stitch';
-      a.download = `${threadName.toLowerCase().replace(/\s+/g, '-')}-${frame.aspectW}-${frame.aspectH}-${result.width}x${result.height}.png`;
-      a.click();
+      downloadPngDataUrl(
+        result.dataUrl,
+        `${threadName.toLowerCase().replace(/\s+/g, '-')}-${frame.aspectW}-${frame.aspectH}-${result.width}x${result.height}.png`,
+      );
 
       // Also drop the result on the canvas at native pixel size so it can be reused.
       pushHistory();
@@ -1315,11 +1330,13 @@ export default function SmartStitchView() {
 
   const handleDownloadStitch = (item: CanvasItem) => {
     if (!item.dataUrl) return;
-    const a = document.createElement('a');
-    a.href = item.dataUrl;
     const threadName = threads.find(t => t.id === activeThreadId)?.name || 'stitch';
-    a.download = `${threadName.toLowerCase().replace(/\s+/g, '-')}-${item.stitchMode}-${Date.now()}.png`;
-    a.click();
+    // A native-resolution stitch is a multi-MB data URL; browsers refuse to
+    // download those from a detached anchor, which is why this used to do nothing.
+    downloadPngDataUrl(
+      item.dataUrl,
+      `${threadName.toLowerCase().replace(/\s+/g, '-')}-${item.stitchMode}-${Date.now()}.png`,
+    );
   };
 
   // --- Derived ---
@@ -1584,6 +1601,13 @@ export default function SmartStitchView() {
                     className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Auto-arrange selected into justified rows (preview)">
                     <Sparkles size={13} /> Auto Arrange
+                  </button>
+                  <button onClick={enterAutoStitchFromSelection} disabled={selectedIds.size < 2}
+                    className="bg-background border border-border hover:border-accent text-secondary hover:text-accent px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={selectedIds.size < 2
+                      ? 'Box-select two or more items on the canvas to auto stitch them'
+                      : `Auto stitch the ${selectedIds.size} selected items — arrange, stitch, download`}>
+                    <Sparkles size={13} /> Auto Stitch{selectedIds.size >= 2 ? ` (${selectedIds.size})` : ''}
                   </button>
                   <button onClick={handleManualStitch} disabled={canvasItems.length === 0 || isStitching}
                     className="bg-inverse text-inverseText hover:bg-accent hover:text-white px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 shadow-sharp transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1994,8 +2018,9 @@ export default function SmartStitchView() {
                 Cancel
               </button>
               <button onClick={approveAutoPreview} disabled={isStitching}
+                title={autoPreview?.autoDownload ? 'Stitch and download the PNG' : 'Stitch the arrangement'}
                 className="flex-1 py-2.5 rounded-lg bg-accent text-white hover:bg-orange-600 transition-colors text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-40">
-                <Check size={13} /> Approve
+                <Check size={13} /> {isStitching ? 'Stitching…' : autoPreview?.autoDownload ? 'Stitch + Download' : 'Approve'}
               </button>
             </div>
           </div>
