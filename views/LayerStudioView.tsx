@@ -49,14 +49,21 @@ import {
 
 // --- Config ---
 const DOC_LONG = 2048;         // artboard long-edge working resolution (px)
-const EXPORT_LONG_EDGE = 2048; // minimum export long edge (larger docs export at their own resolution)
-// 4K is the ceiling for everything Auto Stitch produces — the stitch canvas and
-// the export that follows it. Recovering full source resolution for a dense
-// stitch would mean 8K+ files; 4K is the deliverable size, so the layout is
-// allowed to downscale sources rather than blow past it.
+const EXPORT_LONG_EDGE = 2048; // floor: a small artboard still exports usefully big
+// Delivery sizes. 2K is the default; 4K is one click away for a sheet that holds
+// more than 2K of source detail (two stitched 2K images do — see EXPORT_SIZES).
 const MAX_LONG_EDGE_4K = 4096;
 const EXPORT_MAX_SIDE = MAX_LONG_EDGE_4K;
 const EXPORT_MAX_PIXELS = MAX_LONG_EDGE_4K * MAX_LONG_EDGE_4K;
+const EXPORT_SIZES = [
+  { label: '2K', value: 2048 },
+  { label: '4K', value: MAX_LONG_EDGE_4K },
+] as const;
+const EXPORT_SIZE_KEY = 'ls-export-size';
+const readExportSize = () => {
+  const n = Number(localStorage.getItem(EXPORT_SIZE_KEY));
+  return EXPORT_SIZES.some(o => o.value === n) ? n : 2048;
+};
 const DEFAULT_BG = '#3a3a3c';  // neutral grey studio backdrop
 
 const ASPECTS: { label: string; w: number; h: number; hint?: string }[] = [
@@ -257,6 +264,11 @@ const LayerStudioView: React.FC = () => {
   const [nativeScale, setNativeScale] = useState(1);
   const nativeScaleRef = useRef(1);
   nativeScaleRef.current = nativeScale;
+  // Delivery size ceiling for export: 2K by default, 4K on request.
+  const [exportSize, setExportSize] = useState<number>(readExportSize);
+  const exportSizeRef = useRef(exportSize);
+  exportSizeRef.current = exportSize;
+  const pickExportSize = (v: number) => { setExportSize(v); localStorage.setItem(EXPORT_SIZE_KEY, String(v)); };
 
   // --- Project: shared assets + tabs ---
   // Assets are uploaded once and shared across every tab in the project.
@@ -2174,6 +2186,7 @@ const LayerStudioView: React.FC = () => {
     docW, docH,
     wanted: nativeScale,
     minLongEdge: EXPORT_LONG_EDGE,
+    maxLongEdge: exportSize,
     maxSide: EXPORT_MAX_SIDE,
     maxPixels: EXPORT_MAX_PIXELS,
   });
@@ -2181,6 +2194,10 @@ const LayerStudioView: React.FC = () => {
     w: Math.round(docW * exportScale),
     h: Math.round(docH * exportScale),
   };
+  // Pixels the composition could fill if nothing capped it — used to say plainly
+  // when the chosen size is leaving source detail on the floor.
+  const contentLongEdge = Math.round(Math.max(docW, docH) * Math.max(1, nativeScale));
+  const exportBelowContent = contentLongEdge > Math.max(exportDims.w, exportDims.h) + 1;
   const exportImage = async () => {
     const dw = docWRef.current, dh = docHRef.current;
     if (!dw || !dh) return;
@@ -2190,6 +2207,7 @@ const LayerStudioView: React.FC = () => {
         docW: dw, docH: dh,
         wanted: nativeScaleRef.current,
         minLongEdge: EXPORT_LONG_EDGE,
+        maxLongEdge: exportSizeRef.current,
         maxSide: EXPORT_MAX_SIDE,
         maxPixels: EXPORT_MAX_PIXELS,
       });
@@ -2434,11 +2452,36 @@ const LayerStudioView: React.FC = () => {
               className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0" title="Fit (F)">
               <Maximize size={13} /> Fit
             </button>
+            {/* Delivery size. 2K by default; 4K when the sheet holds more than
+                2K of source detail — two stitched 2K images do. */}
+            <div className="flex items-center bg-surface rounded-lg p-0.5 shrink-0">
+              {EXPORT_SIZES.map(o => (
+                <button key={o.label} onClick={() => pickExportSize(o.value)}
+                  title={o.value === exportSize
+                    ? `Export size ${o.label} — ${exportDims.w}×${exportDims.h}`
+                    : `Export at ${o.label} (${o.value}px long edge)`}
+                  className={`text-[10px] font-mono uppercase tracking-wide px-2 py-1 rounded transition-colors ${
+                    o.value === exportSize ? 'bg-inverse text-inverseText' : 'text-secondary hover:text-primary'}`}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
             <button onClick={exportImage} disabled={exporting}
-              title={`Exports ${exportDims.w}×${exportDims.h} PNG${exportScale > 1.001 ? ` — rendered at ${exportScale.toFixed(2)}× the artboard to recover source detail, up to 4K` : ''}`}
+              title={[
+                `Exports ${exportDims.w}×${exportDims.h} PNG`,
+                exportScale > 1.001 ? `rendered at ${exportScale.toFixed(2)}× the artboard to recover source detail` : null,
+                exportBelowContent ? `this composition holds ${contentLongEdge}px — pick 4K to keep all of it` : null,
+              ].filter(Boolean).join(' — ')}
               className="flex items-center gap-2 bg-accent text-white text-xs font-medium px-4 py-2 rounded-lg hover:opacity-90 disabled:opacity-40 transition-opacity shrink-0 whitespace-nowrap">
               <Download size={14} /> {exporting ? 'Exporting…' : `Export ${(() => { const l = Math.max(exportDims.w, exportDims.h) / 1024; return `${l.toFixed(l % 1 < 0.05 ? 0 : 1)}K`; })()}`}
             </button>
+            {exportBelowContent && (
+              <button onClick={() => pickExportSize(MAX_LONG_EDGE_4K)}
+                title={`This composition holds ${contentLongEdge}px of source detail — more than ${exportDims.w}×${exportDims.h}. Click to export at 4K.`}
+                className="font-mono text-[9px] uppercase tracking-wider text-accent hover:underline shrink-0">
+                4K available
+              </button>
+            )}
           </div>
         </div>
 

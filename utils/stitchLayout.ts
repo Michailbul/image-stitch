@@ -209,13 +209,22 @@ export const fitStitchInBox = (items: StitchInput[], opts: FitStitchOptions): St
 };
 
 /**
- * Scale at which to render a document so a stitch that the artboard's pixel
- * budget had to shrink comes back out at full source resolution.
+ * Scale at which to render a document for export.
  *
- * The working canvas is deliberately capped (a 40MP artboard would make painting
- * and panning crawl), so a dense stitch is laid out smaller than its sources.
- * Export is transient and can afford far more, so it renders at `wanted` — the
- * factor the layout was short by — under its own, looser caps.
+ * Three forces, in order:
+ *
+ *  1. What the composition *has*. The working canvas is deliberately capped (a
+ *     40MP artboard would make painting and panning crawl), so a dense stitch is
+ *     laid out smaller than its sources. `wanted` is the factor it fell short by,
+ *     and `docLong * wanted` is the pixel width the content can actually fill.
+ *  2. `maxLongEdge` — the chosen delivery size, and a true ceiling: a 4096-wide
+ *     artboard exported at a 2K ceiling is scaled *down* to 2048. This is why the
+ *     ceiling is a size choice, not a resolution guarantee — two stitched 2K
+ *     images hold 4096px of detail, and a 2K ceiling halves each of them.
+ *  3. `minLongEdge` — a floor so a small artboard still exports usefully big
+ *     (never above the ceiling).
+ *
+ * `maxSide`/`maxPixels` are the hard safety caps on the export canvas itself.
  */
 export const exportScaleForDoc = (opts: {
   docW: number;
@@ -224,19 +233,26 @@ export const exportScaleForDoc = (opts: {
   wanted: number;
   /** Floor on the output long edge, so small artboards still export usefully big. */
   minLongEdge?: number;
+  /** Ceiling on the output long edge — the delivery size (e.g. 2048 or 4096). */
+  maxLongEdge?: number;
   maxSide?: number;
   maxPixels?: number;
 }): number => {
   const dw = Math.max(1, opts.docW);
   const dh = Math.max(1, opts.docH);
   const long = Math.max(dw, dh);
-  const floor = opts.minLongEdge ? Math.max(1, opts.minLongEdge / long) : 1;
-  const wanted = Math.max(1, floor, Number.isFinite(opts.wanted) ? opts.wanted : 1);
+  const wanted = Math.max(1, Number.isFinite(opts.wanted) ? opts.wanted : 1);
+  const ceiling = opts.maxLongEdge && opts.maxLongEdge > 0 ? opts.maxLongEdge : Infinity;
+
+  // Pixels the content can fill, lifted to the floor, then held to the ceiling.
+  let target = long * wanted;
+  if (opts.minLongEdge) target = Math.max(target, Math.min(opts.minLongEdge, ceiling));
+  target = Math.min(target, ceiling);
+
   const maxSide = opts.maxSide ?? 16384;
   const maxPixels = opts.maxPixels ?? 8192 * 8192;
   const cap = Math.min(maxSide / long, Math.sqrt(maxPixels / (dw * dh)));
-  // A doc already past the caps still exports at 1:1 — never below its own pixels.
-  return Math.max(1, Math.min(wanted, cap));
+  return Math.max(0.01, Math.min(target / long, cap));
 };
 
 export interface NativeStitchOptions {

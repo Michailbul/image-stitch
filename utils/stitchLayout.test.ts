@@ -196,9 +196,50 @@ describe('fitStitchInBox nativeScale', () => {
 });
 
 describe('exportScaleForDoc', () => {
-  it('never returns less than 1 — a doc always exports at its own resolution', () => {
+  it('stays at 1 when the doc is already at the safety caps', () => {
     expect(exportScaleForDoc({ docW: 8192, docH: 8192, wanted: 3, maxSide: 8192, maxPixels: 8192 * 8192 })).toBe(1);
     expect(exportScaleForDoc({ docW: 4000, docH: 3000, wanted: 0.2 })).toBe(1);
+  });
+
+  describe('delivery-size ceiling', () => {
+    // The case that motivated it: two 2K images stitched side by side hold 4096px
+    // of real detail, so a 2K ceiling halves each of them and 4K keeps them whole.
+    const twoStitched2K = { docW: 4096, docH: 1152, wanted: 1 };
+
+    it('a 2K ceiling scales a 4K sheet down to 2048', () => {
+      const k = exportScaleForDoc({ ...twoStitched2K, minLongEdge: 2048, maxLongEdge: 2048 });
+      expect(4096 * k).toBeCloseTo(2048, 0);
+      expect(k).toBeLessThan(1); // a real ceiling, not just a cap on upscaling
+    });
+
+    it('a 4K ceiling keeps every pixel of that sheet', () => {
+      const k = exportScaleForDoc({ ...twoStitched2K, minLongEdge: 2048, maxLongEdge: 4096 });
+      expect(4096 * k).toBeCloseTo(4096, 0);
+    });
+
+    it('a single 2K artboard exports 2K under either ceiling', () => {
+      for (const ceiling of [2048, 4096]) {
+        const k = exportScaleForDoc({ docW: 2048, docH: 1152, wanted: 1, minLongEdge: 2048, maxLongEdge: ceiling });
+        expect(2048 * k).toBeCloseTo(2048, 0);
+      }
+    });
+
+    it('lifts a small artboard to the floor but never past the ceiling', () => {
+      expect(exportScaleForDoc({ docW: 1024, docH: 512, wanted: 1, minLongEdge: 2048, maxLongEdge: 2048 })).toBeCloseTo(2, 5);
+      expect(exportScaleForDoc({ docW: 1024, docH: 512, wanted: 1, minLongEdge: 4096, maxLongEdge: 2048 })).toBeCloseTo(2, 5);
+    });
+
+    it('does not upscale past what the content holds, even under a 4K ceiling', () => {
+      // A 3000px-wide doc at full detail exports 3000, not 4096.
+      const k = exportScaleForDoc({ docW: 3000, docH: 2000, wanted: 1, minLongEdge: 2048, maxLongEdge: 4096 });
+      expect(3000 * k).toBeCloseTo(3000, 0);
+    });
+
+    it('takes the clamped stitch back up to the ceiling when the content wants it', () => {
+      // Artboard held to 2048 by its budget, content worth 4096.
+      const k = exportScaleForDoc({ docW: 2048, docH: 1152, wanted: 2, minLongEdge: 2048, maxLongEdge: 4096 });
+      expect(2048 * k).toBeCloseTo(4096, 0);
+    });
   });
 
   it('lifts small artboards to the minimum long edge', () => {
