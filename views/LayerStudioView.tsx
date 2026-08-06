@@ -45,6 +45,7 @@ import {
   Link,
   Unlink,
   Rows3,
+  Lock,
 } from 'lucide-react';
 
 // --- Config ---
@@ -161,9 +162,23 @@ const readPanelW = () => {
 const readOpen = (key: string) => localStorage.getItem(`ls-open-${key}`) !== '0';
 const writeOpen = (key: string, open: boolean) => localStorage.setItem(`ls-open-${key}`, open ? '1' : '0');
 
+/**
+ * Canvas mode — does the artboard follow the images, or hold the size you gave it?
+ *
+ *  'stitch' — imports are auto-arranged into justified rows and the artboard is
+ *             resized to that layout, at the highest resolution up to 4K.
+ *             For building sheets out of many frames.
+ *  'fixed'  — the artboard never resizes on its own. Imports drop in centered at
+ *             fit scale, Auto Stitch arranges inside the existing frame.
+ *             For compositing on a set canvas.
+ */
+type CanvasMode = 'stitch' | 'fixed';
+const CANVAS_MODE_KEY = 'ls-canvas-mode';
+const readCanvasMode = (): CanvasMode =>
+  localStorage.getItem(CANVAS_MODE_KEY) === 'fixed' ? 'fixed' : 'stitch';
+
 // --- Auto Stitch preferences (remembered across sessions) ---
 const STITCH_GAP_KEY = 'ls-stitch-gap';     // gap as % of the block width
-const STITCH_FIT_KEY = 'ls-stitch-fit';     // size the canvas to the stitch
 const STITCH_AUTO_KEY = 'ls-stitch-auto';   // stitch automatically on import
 const STITCH_GAP_DEFAULT = 1.5;
 const STITCH_GAP_MAX = 8;
@@ -248,14 +263,19 @@ const LayerStudioView: React.FC = () => {
   // clears these (it shows whole frames) but never touches hand-painted or AI masks.
   const croppedRef = useRef<Set<string>>(new Set());
 
-  // --- Auto Stitch settings ---
+  // --- Canvas mode + Auto Stitch settings ---
+  const [canvasMode, setCanvasMode] = useState<CanvasMode>(readCanvasMode);
+  const canvasModeRef = useRef(canvasMode);
+  canvasModeRef.current = canvasMode;
+  const pickCanvasMode = (m: CanvasMode) => {
+    canvasModeRef.current = m;
+    setCanvasMode(m);
+    localStorage.setItem(CANVAS_MODE_KEY, m);
+  };
   const [stitchGap, setStitchGap] = useState(readStitchGap);
-  const [stitchFitCanvas, setStitchFitCanvas] = useState(() => readFlag(STITCH_FIT_KEY, true));
   const [stitchOnImport, setStitchOnImport] = useState(() => readFlag(STITCH_AUTO_KEY, true));
   const stitchGapRef = useRef(stitchGap);
   stitchGapRef.current = stitchGap;
-  const stitchFitCanvasRef = useRef(stitchFitCanvas);
-  stitchFitCanvasRef.current = stitchFitCanvas;
   const stitchOnImportRef = useRef(stitchOnImport);
   stitchOnImportRef.current = stitchOnImport;
   // How much bigger than the artboard the composition would have to be for every
@@ -469,10 +489,12 @@ const LayerStudioView: React.FC = () => {
     selectedIdsRef.current = new Set();
     if (lastId) setActiveId(lastId);
 
-    // Two or more frames on the artboard would otherwise land as a centered
-    // pile. Stitch them into justified rows instead (history was pushed above).
+    // Stitch mode: two or more frames on the artboard would otherwise land as a
+    // centered pile, so arrange them into justified rows (history pushed above).
+    // Fixed mode: leave them stacked — the canvas and the composition are the
+    // user's to arrange.
     const all = [...layersRef.current, ...newLayers];
-    const stitch = stitchOnImportRef.current && all.length > 1;
+    const stitch = canvasModeRef.current === 'stitch' && stitchOnImportRef.current && all.length > 1;
     setTimeout(() => {
       if (stitch) stitchLayers({ history: false, layers: all });
       else { fitView(dw, dh); redrawAll(); }
@@ -2074,11 +2096,12 @@ const LayerStudioView: React.FC = () => {
   // native aspect, rows are justified to a common width, and the row split is
   // chosen to land closest to the artboard's aspect.
   //
-  // With "Fit canvas" on, the artboard is resized to the stitch and its
-  // resolution raised toward the point where no image is downscaled — so the
-  // composite is sharp instead of squeezed into a 2K frame. 4K is the ceiling:
-  // a dense stitch of large sources is downscaled to fit it rather than growing
-  // into an 8K file.
+  // In Stitch mode the artboard is resized to the layout and its resolution
+  // raised toward the point where no image is downscaled — so the composite is
+  // sharp instead of squeezed into a 2K frame. 4K is the ceiling: a dense stitch
+  // of large sources is downscaled to fit it rather than growing into an 8K file.
+  // In Fixed mode the artboard is left exactly as it is and the rows are fitted
+  // inside it.
   // ---------------------------------------------------------------------------
   const stitchLayers = (opts: { history?: boolean; layers?: CompLayer[] } = {}) => {
     // `opts.layers` lets a caller stitch a list it has in hand — importFiles runs
@@ -2113,7 +2136,7 @@ const LayerStudioView: React.FC = () => {
       placements = layout.items.map(p => ({ ...p, x: p.x + b.x, y: p.y + b.y }));
       // Keep whatever the doc already needed; a subset never lowers the bar.
       wantScale = Math.max(nativeScaleRef.current, layout.nativeScale);
-    } else if (stitchFitCanvasRef.current) {
+    } else if (canvasModeRef.current === 'stitch') {
       const layout = stitchAtNativeResolution(inputs, {
         gapRatio,
         targetAspect: dw / dh,
@@ -2436,7 +2459,18 @@ const LayerStudioView: React.FC = () => {
               </button>
             </div>
             <span className="font-mono text-[10px] text-secondary tabular-nums">{zoomPct}%</span>
-            <span className="font-mono text-[10px] text-secondary">{docW}×{docH}</span>
+            {/* Canvas size doubles as the mode switch — the mode is only ever
+                visible through what the size does, so it belongs on the number. */}
+            <button onClick={() => pickCanvasMode(canvasMode === 'fixed' ? 'stitch' : 'fixed')}
+              title={canvasMode === 'fixed'
+                ? 'Fixed canvas — the artboard keeps this size, imports drop in centered. Click to let it follow the images.'
+                : 'Stitch canvas — imports are auto-arranged and the artboard resizes to fit, up to 4K. Click to lock this size.'}
+              className="flex items-center gap-1 font-mono text-[10px] text-secondary hover:text-primary px-1.5 py-1 rounded hover:bg-surface shrink-0">
+              {canvasMode === 'fixed'
+                ? <Lock size={10} className="text-accent" />
+                : <Rows3 size={10} className="text-accent" />}
+              {docW}×{docH}
+            </button>
             <button onClick={() => autoLayout()} disabled={!hasLayers}
               className="text-xs text-secondary hover:text-primary flex items-center gap-1 px-2 py-1 rounded hover:bg-surface shrink-0 disabled:opacity-30 disabled:hover:text-secondary" title="Fill — tile the artboard, cropping each image to its cell (L)">
               <LayoutGrid size={13} /> Fill
@@ -2598,6 +2632,28 @@ const LayerStudioView: React.FC = () => {
             onToggle={() => toggleSection('artboard', setShowArtboard)} right={`${docW}×${docH}`} />
         {showArtboard && (
         <div className="px-4 pb-4 space-y-3">
+          {/* Canvas mode — the single answer to "why did my canvas just change?" */}
+          <div>
+            <span className="text-[10px] font-mono uppercase tracking-wide text-secondary">Canvas mode</span>
+            <div className="grid grid-cols-2 gap-1.5 mt-1.5">
+              <button onClick={() => pickCanvasMode('fixed')}
+                title="The artboard keeps the size you set. Imports drop in centered, nothing resizes."
+                className={`flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide py-1.5 rounded border transition-colors ${canvasMode === 'fixed' ? 'border-accent text-accent bg-accentDim' : 'border-border text-secondary hover:text-primary hover:border-accent/50'}`}>
+                <Lock size={10} /> Fixed
+              </button>
+              <button onClick={() => pickCanvasMode('stitch')}
+                title="The artboard follows the images: imports are auto-arranged and the canvas is resized to the stitch, up to 4K."
+                className={`flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide py-1.5 rounded border transition-colors ${canvasMode === 'stitch' ? 'border-accent text-accent bg-accentDim' : 'border-border text-secondary hover:text-primary hover:border-accent/50'}`}>
+                <Rows3 size={10} /> Stitch
+              </button>
+            </div>
+            <p className="text-[9px] font-mono text-secondary/70 leading-relaxed mt-1.5">
+              {canvasMode === 'fixed'
+                ? 'Canvas stays at the size you set. Imports land centered at fit scale.'
+                : 'Canvas follows the images — imports are stitched and it resizes to fit, up to 4K.'}
+            </p>
+          </div>
+
           <div className="grid grid-cols-4 gap-1.5">
             {ASPECTS.map(a => (
               <button key={a.label} onClick={() => applyAspect(a.w, a.h)}
@@ -2681,22 +2737,20 @@ const LayerStudioView: React.FC = () => {
           <div className="px-4 pb-4 space-y-3">
             <PropSlider label="Gap" value={stitchGap} min={0} max={STITCH_GAP_MAX} step={0.5} suffix="%"
               onChange={(v: number) => { setStitchGap(v); localStorage.setItem(STITCH_GAP_KEY, String(v)); }} />
-            <button onClick={() => { const v = !stitchFitCanvas; setStitchFitCanvas(v); localStorage.setItem(STITCH_FIT_KEY, v ? '1' : '0'); }}
-              title="On: the canvas is resized to the stitch, at the highest resolution up to 4K. Off: the stitch is fitted inside the current artboard."
-              className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
-              <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchFitCanvas ? 'bg-accent border-accent' : 'border-border'}`}>
-                {stitchFitCanvas && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
-              </span>
-              Fit canvas to stitch
-            </button>
-            <button onClick={() => { const v = !stitchOnImport; setStitchOnImport(v); localStorage.setItem(STITCH_AUTO_KEY, v ? '1' : '0'); }}
-              title="Arrange automatically whenever an import leaves more than one layer on the artboard."
-              className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
-              <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchOnImport ? 'bg-accent border-accent' : 'border-border'}`}>
-                {stitchOnImport && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
-              </span>
-              Stitch on import
-            </button>
+            {canvasMode === 'stitch' ? (
+              <button onClick={() => { const v = !stitchOnImport; setStitchOnImport(v); localStorage.setItem(STITCH_AUTO_KEY, v ? '1' : '0'); }}
+                title="Arrange automatically whenever an import leaves more than one layer on the artboard."
+                className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-wide text-secondary hover:text-primary transition-colors">
+                <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center ${stitchOnImport ? 'bg-accent border-accent' : 'border-border'}`}>
+                  {stitchOnImport && <span className="w-1.5 h-1.5 bg-white rounded-sm" />}
+                </span>
+                Stitch on import
+              </button>
+            ) : (
+              <p className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wide text-secondary/70">
+                <Lock size={10} /> Fixed canvas — stitches inside {docW}×{docH}
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <button onClick={() => stitchLayers()} disabled={!hasLayers}
                 className="flex-1 flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-wide px-2 py-2 rounded border border-border text-secondary hover:text-primary hover:border-accent transition-colors disabled:opacity-30 disabled:hover:text-secondary disabled:hover:border-border">
@@ -2709,7 +2763,8 @@ const LayerStudioView: React.FC = () => {
               </button>
             </div>
             <p className="text-[9px] font-mono text-secondary/70 leading-relaxed">
-              Justified rows, whole frames, nothing cropped. Row split follows the artboard aspect. Max 4K.
+              Justified rows, whole frames, nothing cropped. Row split follows the artboard aspect.
+              {canvasMode === 'stitch' ? ' The canvas is resized to the result, max 4K.' : ' The canvas is left alone.'}
               {' '}Box-select on the artboard (move tool) to stitch only those layers, in place.
             </p>
           </div>
