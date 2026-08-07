@@ -75,8 +75,11 @@ function App({ embedded = false }: { embedded?: boolean } = {}) {
   const activeGroup = groups.find(g => g.id === activeAssetId);
 
   // --- Theme Toggle ---
-  // When embedded (e.g. in landing page hero), don't manage the documentElement
-  // class — the landing page owns dark mode for the whole page.
+  // `embedded` is for hosting the workspace inside another React layout, where
+  // the host owns dark mode for the whole page and this component must not
+  // touch documentElement. Nothing passes it since the marketing page was
+  // removed — App is mounted straight at the root — but the seam is cheap to
+  // keep and the alternative is a component that fights its host.
   useEffect(() => {
     if (embedded) return;
     if (isDarkMode) {
